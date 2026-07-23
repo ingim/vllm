@@ -293,6 +293,13 @@ def test_plex_async_reports_progress_and_selection_enactment():
         target_id="test",
     )
     request = create_requests(num_requests=1, num_tokens=10)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {
+        "plex": {
+            "principal_id": "tenant",
+            "group_id": "workflow",
+        }
+    }
     scheduler.add_request(request)
     scheduler.publish_plex()
     epoch = next(
@@ -342,12 +349,18 @@ def test_plex_async_reports_progress_and_selection_enactment():
         for record in feedback["context"]["records"]
         if record["subject"]["kind"] == "schedule-selection"
     )
+    group_progress = next(
+        record
+        for record in feedback["context"]["records"]
+        if record["subject"]["kind"] == "work-group"
+    )
     assert progress["facts"]["committed_tokens"] == 10
     assert progress["facts"]["service_tokens"] == 10
     assert progress["facts"]["input_tokens"] == 9
     assert progress["facts"]["output_tokens"] == 1
     assert selection["facts"]["status"] == "enacted"
     assert selection["facts"]["scheduled_tokens"] == 10
+    assert group_progress["facts"]["service_us"] >= 0
 
 
 def test_plex_async_rejects_request_field_mutation():
@@ -532,6 +545,41 @@ def test_plex_async_missing_plan_uses_native_scheduler():
         requests[1].request_id,
     }
     assert runtime.submissions == []
+
+
+def test_plex_async_merges_validated_policy_facts_below_host_facts():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1)[0]
+    assert request.sampling_params is not None
+    request.sampling_params.extra_args = {
+        "plex": {
+            "principal_id": "trusted-principal",
+            "metadata": {
+                "facts": {
+                    "dependency_depth": 7,
+                    "client_id": "spoofed",
+                    "waiting_ms": 999999,
+                }
+            },
+        }
+    }
+    scheduler.add_request(request)
+
+    scheduler.publish_plex()
+
+    schedule = next(
+        event for channel, _epoch, event in runtime.submissions if channel == "schedule"
+    )
+    facts = schedule["context"]["runnable"][0]["facts"]
+    assert facts["dependency_depth"] == 7
+    assert facts["client_id"] == "trusted-principal"
+    assert facts["waiting_ms"] < 999999
 
 
 def test_plex_async_feedback_is_coalesced_until_publish():

@@ -62,6 +62,11 @@ public request bodies.
 the whole group. `group_limits` may specify positive `max_members` and
 `max_scratch_bytes`.
 
+Policy-specific observations may be supplied under `metadata.facts`. They are
+untrusted adapter inputs: deployments must validate them at authenticated
+ingress. Engine-owned fields such as `client_id`, service counters, waiting
+time, preemption state, and cache size always override conflicting values.
+
 The legacy `logical_request_id` key is accepted as an alias for `request_id`
 when only one is supplied.
 

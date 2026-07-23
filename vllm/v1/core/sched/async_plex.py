@@ -357,14 +357,15 @@ class AsyncPlexPolicyController:
             else 0
         )
         input_tokens = max(committed_tokens - output_tokens, 0)
-        record = self._pending_progress.get(request_id)
+        request_key = f"request:{request_id}"
+        record = self._pending_progress.get(request_key)
         if record is None:
             record = {
                 "subject": {"kind": "request", "value": request_id},
                 "outcome": "progress",
                 "facts": self._feedback_facts(request),
             }
-            self._pending_progress[request_id] = record
+            self._pending_progress[request_key] = record
         facts = record["facts"]
         facts.update(self._feedback_facts(request))
         for field, value in (
@@ -375,6 +376,18 @@ class AsyncPlexPolicyController:
             ("service_us", service_us),
         ):
             facts[field] = facts.get(field, 0) + value
+        group_id = self._request_group.get(request.request_id)
+        if group_id is not None:
+            group_key = f"group:{group_id}"
+            group_record = self._pending_progress.get(group_key)
+            if group_record is None:
+                group_record = {
+                    "subject": {"kind": "work-group", "value": group_id},
+                    "outcome": "progress",
+                    "facts": {"service_us": 0},
+                }
+                self._pending_progress[group_key] = group_record
+            group_record["facts"]["service_us"] += service_us
 
     def mark_cache_enacted(
         self,
@@ -1177,11 +1190,19 @@ class AsyncPlexPolicyController:
 
     def _facts(self, request: Request) -> dict[str, Any]:
         principal_id = self._request_principal[request.request_id]
+        request_id = self._engine_to_request[request.request_id]
+        metadata = self._request_metadata.get(request_id, {})
+        policy_facts = metadata.get("facts", {})
         return {
+            **policy_facts,
             "engine_request_id": request.request_id,
             "client_id": principal_id,
             "attained_service": request.num_computed_tokens,
             "service_tokens": request.num_computed_tokens,
+            "dispatch_input_tokens": max(
+                request.num_prompt_tokens - request.num_computed_tokens,
+                0,
+            ),
             "generated_tokens": len(request.output_token_ids),
             "preempted": request.num_preemptions > 0,
             "preemptions": request.num_preemptions,
@@ -1413,6 +1434,11 @@ class AsyncPlexPolicyController:
         if not isinstance(metadata, Mapping):
             raise ValueError("PLEX metadata must be an object")
         json.dumps(metadata, allow_nan=False)
+        policy_facts = metadata.get("facts", {})
+        if not isinstance(policy_facts, Mapping) or any(
+            not isinstance(key, str) for key in policy_facts
+        ):
+            raise ValueError("PLEX metadata.facts must be an object")
         return (
             request_id,
             generation_id,
