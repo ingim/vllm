@@ -39,6 +39,10 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.async_plex import (
+    AsyncPlexPolicyController,
+    PlexSchedulePlan,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -348,6 +352,14 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        self.plex: AsyncPlexPolicyController | None = None
+        if self.scheduler_config.plex_policy is not None:
+            self.plex = AsyncPlexPolicyController.from_policy(
+                self.scheduler_config.plex_policy,
+                model=vllm_config.model_config.model,
+                target_id=f"dp-{self.parallel_config.data_parallel_index}",
+            )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -461,11 +473,23 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+        plex_plan = self.plex.poll_schedule() if self.plex is not None else None
+        if plex_plan is not None:
+            self.running.sort(
+                key=lambda request: (
+                    plex_plan.rank(request.request_id) is None,
+                    plex_plan.rank(request.request_id) or 0,
+                )
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if plex_plan is not None and not plex_plan.selects(request.request_id):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -512,6 +536,10 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            if plex_plan is not None:
+                num_new_tokens = min(
+                    num_new_tokens, plex_plan.token_budget(request.request_id)
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -569,32 +597,50 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    victim_id = (
+                        self.plex.cached_preemption() if self.plex is not None else None
+                    )
+                    preempted_req = (
+                        next(
+                            (
+                                candidate
+                                for candidate in self.running
+                                if candidate.request_id == victim_id
+                            ),
+                            None,
+                        )
+                        if victim_id is not None
+                        else None
+                    )
+                    if preempted_req is not None:
+                        self.running.remove(preempted_req)
+                    elif self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
                     else:
                         preempted_req = self.running.pop()
+
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
+                            )
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -669,10 +715,12 @@ class Scheduler(SchedulerInterface):
                 if num_running >= self.max_num_running_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
-
-                request = request_queue.peek_request()
+                selected_waiting = self._select_waiting_request_for_scheduling(
+                    plex_plan
+                )
+                if selected_waiting is None:
+                    break
+                request_queue, request = selected_waiting
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -684,7 +732,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    self._remove_waiting_request(request_queue, request)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -699,7 +747,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    self._remove_waiting_request(request_queue, request)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -770,7 +818,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            self._remove_waiting_request(request_queue, request)
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -795,7 +843,7 @@ class Scheduler(SchedulerInterface):
                             request, num_computed_tokens
                         )
                     ):
-                        request_queue.pop_request()
+                        self._remove_waiting_request(request_queue, request)
                         step_skipped_waiting.prepend_request(request)
                         continue
 
@@ -867,6 +915,10 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if plex_plan is not None:
+                        num_new_tokens = min(
+                            num_new_tokens, plex_plan.token_budget(request_id)
+                        )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -975,7 +1027,7 @@ class Scheduler(SchedulerInterface):
                         request, num_new_local_computed_tokens
                     )
 
-                request = request_queue.pop_request()
+                self._remove_waiting_request(request_queue, request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1232,6 +1284,8 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+        if self.plex is not None:
+            self.plex.mark_preempted(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1649,6 +1703,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        plex_finished: list[tuple[Request, str]] = []
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1813,6 +1868,7 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
+                    plex_finished.append((request, str(finish_reason)))
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1951,6 +2007,10 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if (plex := getattr(self, "plex", None)) is not None:
+            for request, finish_reason in plex_finished:
+                plex.mark_finished(request, finish_reason)
+
         return engine_core_outputs
 
     @staticmethod
@@ -1978,6 +2038,33 @@ class Scheduler(SchedulerInterface):
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    def _select_waiting_request_for_scheduling(
+        self, plex_plan: PlexSchedulePlan | None
+    ) -> tuple[RequestQueue, Request] | None:
+        if plex_plan is None:
+            request_queue = self._select_waiting_queue_for_scheduling()
+            if request_queue is None:
+                return None
+            return request_queue, request_queue.peek_request()
+
+        selected: tuple[int, RequestQueue, Request] | None = None
+        for request_queue in (self.waiting, self.skipped_waiting):
+            for request in request_queue:
+                rank = plex_plan.rank(request.request_id)
+                if rank is not None and (selected is None or rank < selected[0]):
+                    selected = (rank, request_queue, request)
+        if selected is None:
+            return None
+        return selected[1], selected[2]
+
+    @staticmethod
+    def _remove_waiting_request(request_queue: RequestQueue, request: Request) -> None:
+        if request_queue.peek_request() is request:
+            popped = request_queue.pop_request()
+            assert popped is request
+        else:
+            request_queue.remove_request(request)
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
@@ -2127,14 +2214,19 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
-            if request.resumable:
-                request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
-            self.requests[request.request_id] = request
-            if self.connector is not None:
-                self.connector.on_new_request(request)
-            if self.log_stats:
-                request.record_event(EngineCoreEventType.QUEUED)
+            self._activate_request(request)
+            if self.plex is not None:
+                self.plex.register_request(request)
+
+    def _activate_request(self, request: Request) -> None:
+        if request.resumable and request.streaming_queue is None:
+            request.streaming_queue = deque()
+        self._enqueue_waiting_request(request)
+        self.requests[request.request_id] = request
+        if self.connector is not None:
+            self.connector.on_new_request(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2196,6 +2288,13 @@ class Scheduler(SchedulerInterface):
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
+
+        if self.plex is not None and valid_requests:
+            for request in valid_requests:
+                self.plex.mark_finished(
+                    request,
+                    str(request.get_finished_reason()),
+                )
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 
@@ -2457,6 +2556,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.plex is not None:
+            self.plex.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -2466,6 +2567,10 @@ class Scheduler(SchedulerInterface):
             self.ec_connector.shutdown()
 
         logger.debug_once("[shutdown] Scheduler: complete")
+
+    def publish_plex(self) -> None:
+        if self.plex is not None:
+            self.plex.publish(self)
 
     ########################################################################
     # KV Connector Related Methods

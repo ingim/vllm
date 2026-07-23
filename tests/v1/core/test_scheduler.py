@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -26,6 +27,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_plex import AsyncPlexPolicyController
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -165,6 +167,107 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     assert len(scheduler.running) == len(requests)
     for i, request in enumerate(requests):
         assert scheduler.running[i] == request
+
+
+class FakeAsyncRuntime:
+    def __init__(self):
+        self.submissions = []
+        self.latest_results = {}
+
+    def try_submit(self, channel, epoch, event):
+        self.submissions.append((channel, epoch, event))
+        return True
+
+    def try_submit_bytes(self, channel, epoch, event):
+        self.submissions.append((channel, epoch, json.loads(event)))
+        return True
+
+    def try_submit_batch(self, channel, epoch, events):
+        self.submissions.append((channel, epoch, events))
+        return True
+
+    def latest(self, channel, after_epoch=0):
+        result = self.latest_results.get(channel)
+        if result is None or result[0] <= after_epoch:
+            return None
+        return result
+
+    def shutdown(self):
+        return None
+
+
+def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.publish_plex()
+    epoch = scheduler.plex.epoch
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "decision": {"selected": [{"candidate_index": 1, "token_budget": 10}]},
+            "request_fields": {},
+            "actions": [],
+        },
+    )
+    submitted = len(runtime.submissions)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {requests[1].request_id: 10}
+    assert len(runtime.submissions) == submitted
+
+
+def test_plex_async_missing_plan_uses_native_scheduler():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {
+        requests[0].request_id,
+        requests[1].request_id,
+    }
+    assert runtime.submissions == []
+
+
+def test_plex_async_feedback_is_coalesced_until_publish():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert runtime.submissions == []
+    scheduler.publish_plex()
+
+    feedback = [
+        event for channel, _epoch, event in runtime.submissions if channel == "feedback"
+    ]
+    assert len(feedback) == 1
+    assert feedback[0]["context"]["records"][0]["event"] == "finished"
 
 
 def test_scheduler_stats_route_to_existing_output_client():

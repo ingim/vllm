@@ -194,6 +194,14 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def take_error_requests(self) -> list[tuple[str, int]]:
+        """Return request IDs and client indexes rejected before execution."""
+        return []
+
+    def publish_plex(self) -> None:
+        """Publish a non-blocking PLEX snapshot outside the scheduling step."""
+        return None
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:

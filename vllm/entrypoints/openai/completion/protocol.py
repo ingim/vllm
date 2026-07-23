@@ -213,6 +213,13 @@ class CompletionRequest(OpenAIBaseModel):
             "numeric values, used by custom extensions."
         ),
     )
+    plex: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "PLEX logical-request metadata, including logical_request_id, "
+            "generation_id, terminal, completion_event, and policy metadata."
+        ),
+    )
 
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,
@@ -334,7 +341,9 @@ class CompletionRequest(OpenAIBaseModel):
 
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if self.plex is not None:
+            extra_args["plex"] = self.plex
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

@@ -214,6 +214,16 @@ def test_jit_monitor_verbose_arg():
     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
 
 
+def test_plex_policy_arg():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--plex-policy", "policy.plexpkg"])
+
+    assert args.plex_policy == "policy.plexpkg"
+    assert EngineArgs(model="test", plex_policy="policy.plexpkg").plex_policy == (
+        "policy.plexpkg"
+    )
+
+
 @pytest.mark.parametrize("mode", ["warn", "error"])
 def test_jit_monitor_mode_arg(mode):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())

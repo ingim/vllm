@@ -119,6 +119,14 @@ class SchedulerConfig:
     the default scheduler. Can be a class directly or the path to a class of
     form "mod.custom_class"."""
 
+    plex_policy: str | None = None
+    """Path to a PLEX ``.plexpkg`` policy package.
+
+    When set, the scheduler invokes the policy through ``pie-plex`` for each
+    scheduling opportunity. Unavailable and fallback outcomes use the native
+    scheduler policy.
+    """
+
     disable_hybrid_kv_cache_manager: bool | None = None
     """If set to True, KV cache manager will allocate the same size of KV cache
     for all attention layers even if there are multiple type of attention layers

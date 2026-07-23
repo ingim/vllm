@@ -281,6 +281,13 @@ class ResponsesRequest(OpenAIBaseModel):
             "numeric values, used by custom extensions."
         ),
     )
+    plex: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "PLEX logical-request metadata, including logical_request_id, "
+            "generation_id, terminal, completion_event, and policy metadata."
+        ),
+    )
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
@@ -416,7 +423,9 @@ class ResponsesRequest(OpenAIBaseModel):
         if isinstance(stop, str):
             stop = [stop]
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if self.plex is not None:
+            extra_args["plex"] = self.plex
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         if self.ec_transfer_params:

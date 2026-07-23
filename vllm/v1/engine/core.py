@@ -1395,10 +1395,12 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+        self.scheduler.publish_plex()
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        self._send_error_outputs(self.scheduler.take_error_requests())
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
@@ -1406,6 +1408,7 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(output)
         # Post-step hook.
         self.post_step(model_executed)
+        self.scheduler.publish_plex()
 
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
@@ -1839,6 +1842,14 @@ class EngineCoreProc(EngineCore):
                 by_client[client_index].add(req_id)
             for client_index, req_ids in by_client.items():
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
+
+    def _send_error_outputs(self, error_reqs: list[tuple[str, int]]) -> None:
+        if error_reqs:
+            by_client = defaultdict[int, set[str]](set)
+            for req_id, client_index in error_reqs:
+                by_client[client_index].add(req_id)
+            for client_index, req_ids in by_client.items():
+                self._send_error_outputs_to_client(list(req_ids), client_index)
 
 
 class DPEngineCoreProc(EngineCoreProc):
