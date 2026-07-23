@@ -597,8 +597,13 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    victim_id = (
+                    cache_decision = (
                         self.plex.cached_preemption() if self.plex is not None else None
+                    )
+                    victim_id = (
+                        cache_decision.request_id
+                        if cache_decision is not None
+                        else None
                     )
                     preempted_req = (
                         next(
@@ -643,6 +648,14 @@ class Scheduler(SchedulerInterface):
                         req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
+                    if cache_decision is not None:
+                        assert self.plex is not None
+                        self.plex.mark_cache_enacted(
+                            cache_decision,
+                            preempted_req
+                            if preempted_req.request_id == cache_decision.request_id
+                            else None,
+                        )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -1240,6 +1253,8 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self.plex is not None:
+            self.plex.mark_scheduled(plex_plan, num_scheduled_tokens)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1730,6 +1745,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            num_rejected = 0
             # Skip a stale frame still pending discard (async_tokens_to_discard
             # > 0): its pre-reset rejection count would underflow the counters.
             if (
@@ -1874,6 +1890,16 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+
+            if self.plex is not None:
+                self.plex.mark_progress(
+                    request,
+                    committed_tokens=max(
+                        num_tokens_scheduled - num_rejected,
+                        0,
+                    ),
+                    output_tokens=len(new_token_ids),
+                )
 
             # Extract sample logprobs if needed.
             if (

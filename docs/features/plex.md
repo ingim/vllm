@@ -1,22 +1,21 @@
 # PLEX serving policies
 
-PLEX loads an operator-provided WebAssembly policy package into an asynchronous
-worker beside the vLLM scheduler. The scheduler never waits for Wasm. It
-consumes cached standing request and retention plans, while lifecycle snapshots
-and coalesced feedback are evaluated off the decode hot path.
+PLEX loads an operator-provided v0.6 WebAssembly policy package into a bounded
+worker beside the vLLM V1 scheduler. The scheduler never waits for Wasm, JSON,
+state access, or Python callbacks. It consumes an immutable cached schedule or
+cache plan and immediately uses native scheduling when a plan is missing,
+stale, unavailable, or failed.
 
 ## Installation and startup
 
-Install the optional `pie-plex` runtime, then pass a `.plexpkg` file:
+Install the optional `pie-plex` 0.6 runtime, then pass a package. vLLM rejects
+runtime releases outside `>=0.6,<0.7` or an incomplete `AsyncRuntime` API.
 
 ```bash
 pip install "vllm[plex]"
 vllm serve Qwen/Qwen2.5-0.5B-Instruct \
   --plex-policy /path/to/policy.plexpkg
 ```
-
-For a source checkout where `pie-plex` is not published on the configured
-package index, install the PLEX Python binding directly before starting vLLM.
 
 The offline API accepts the same configuration:
 
@@ -31,8 +30,7 @@ llm = LLM(
 
 ## Request metadata
 
-The OpenAI Chat, Completions, and Responses APIs accept a structured `plex`
-request field:
+OpenAI Chat, Completions, and Responses requests accept a `plex` object:
 
 ```python
 response = client.chat.completions.create(
@@ -40,67 +38,78 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
     extra_body={
         "plex": {
-            "logical_request_id": "workflow-42",
+            "request_id": "call-42",
+            "principal_id": "acme",
+            "group_id": "workflow-42",
             "generation_id": 0,
-            "tenant": "acme",
+            "terminal": False,
+            "metadata": {"service_class": "interactive"},
         }
     },
 )
 ```
 
-The offline equivalent uses `SamplingParams.extra_args`:
+The offline equivalent uses `SamplingParams.extra_args`.
 
-```python
-SamplingParams(
-    max_tokens=32,
-    extra_args={
-        "plex": {
-            "logical_request_id": "workflow-42",
-            "generation_id": 0,
-        }
-    },
-)
-```
+`request_id` is stable across continuations. A later generation increments
+`generation_id` by exactly one. `group_id` is optional and identifies a trusted
+coordination scope in PLEX state; deployments must derive `principal_id` and
+group authorization from authenticated ingress rather than blindly trusting
+public request bodies.
 
-Metadata keys other than the reserved lifecycle keys become
-`fields.metadata`. The adapter exposes `prompt_token_ids`, `max_tokens`, and
-`priority` in `fields.body`.
+`terminal=False` preserves request policy state for a continuation. Set
+`close_group=True` on a terminal generation only when that generation closes
+the whole group. `group_limits` may specify positive `max_members` and
+`max_scratch_bytes`.
 
-## Logical request continuations
+The legacy `logical_request_id` key is accepted as an alias for `request_id`
+when only one is supplied.
 
-Ordinary requests are terminal and remove their PLEX state when generation
-finishes. To preserve policy state for another model call, mark the generation
-nonterminal:
+## vLLM attachment semantics
 
-```json
-{
-  "logical_request_id": "workflow-42",
-  "generation_id": 0,
-  "terminal": false,
-  "completion_event": "tool-boundary"
-}
-```
-
-The next request uses the same `logical_request_id` and increments
-`generation_id` to `1`. PLEX receives a `continue` lifecycle event and retains
-shared request fields and scratch from generation zero.
-
-## Attachment semantics
-
-| PLEX hook | vLLM attachment |
+| PLEX operation | vLLM attachment |
 |---|---|
-| `admit` | Not attached in-engine; use the deployment router or ingress |
-| `schedule` | Cached standing plan produced after membership changes |
-| `evict` | Cached request-level retention decision |
-| `feedback` | Coalesced completion, abort, and preemption feedback |
+| `admit` | Not attached in-engine; use ingress or a router |
 | `route` | Not attached; routing belongs to the deployment router |
+| `schedule` | One-shot cached singleton selections and token budgets |
+| `cache` | One-shot ordered request-level preemption decisions |
+| `feedback` | Coalesced per-step progress, enactment, completion, abort, and preemption feedback |
 
-The scheduler never waits for PLEX. A missing, stale, unavailable, or failed
-decision uses vLLM's native policy.
-Invalid engine events and backend errors are surfaced instead of being silently
-converted to native scheduling.
+The cache adapter presents one virtual reclaim unit per active request. It is a
+request-preemption seam, not object/page-level cache admission. Prospective
+cache admission and exact shared-block accounting are therefore unsupported by
+this adapter.
 
-PLEX actions and per-token feedback are not advertised by this integration.
-Each engine process owns
-an in-memory PLEX runtime; cross-process or router-to-engine policy state
-requires a distributed PLEX state backend.
+vLLM does not advertise PLEX actions or
+`schedule.atomic-enqueue@1`. Packages requiring those mechanics fail
+attachment. Optional actions remain unavailable.
+
+vLLM refuses to enact outcomes containing actions or mutations to the reserved
+request `fields.body` mirror. Other request fields, shared state, group scratch,
+and request scratch remain policy-private state and do not directly mutate a
+vLLM `Request`. A rejected body mutation is replaced with the canonical host
+value before the next policy invocation. Multi-request selection units are not
+enacted because vLLM cannot guarantee their all-or-none allocation semantics.
+
+## Staleness and fallback
+
+Snapshots are published outside `Scheduler.schedule()`. A bounded Rust queue
+serializes PLEX transactions and atomically publishes the latest result per
+operation. The hot path only reads cached dictionaries.
+
+Each plan is tied to one submitted opportunity and request-membership epoch. It
+is consumed at most once, revalidated against current native feasibility, and
+discarded after 250 ms. Progress and schedule snapshots are coalesced to at most
+one publication window every 25 ms; cache snapshots are published only under KV
+pressure. Request membership changes, preemption, and completion invalidate
+older submissions. Queue-full, stale, unavailable, invalid, unsupported, and
+failed outcomes all use native vLLM behavior.
+
+After model output, vLLM reports committed input/output/service token deltas and
+observed service time. It also reports whether each schedule selection and
+request-level cache reclaim decision was enacted, partially enacted, or rejected
+by current native constraints. Feedback is submitted before the next policy
+snapshot whenever no lifecycle bootstrap is pending.
+
+Each engine process owns an in-memory PLEX backend. Cross-process state requires
+a distributed `PolicyStateBackend`.

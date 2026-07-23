@@ -122,9 +122,10 @@ class SchedulerConfig:
     plex_policy: str | None = None
     """Path to a PLEX ``.plexpkg`` policy package.
 
-    When set, the scheduler invokes the policy through ``pie-plex`` for each
-    scheduling opportunity. Unavailable and fallback outcomes use the native
-    scheduler policy.
+    When set, the scheduler publishes typed PLEX v0.6 lifecycle snapshots to a
+    bounded asynchronous worker. The scheduler consumes only cached plans and
+    immediately uses native behavior when a plan is missing, stale, unavailable,
+    or failed.
     """
 
     disable_hybrid_kv_cache_manager: bool | None = None

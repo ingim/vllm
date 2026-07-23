@@ -192,6 +192,9 @@ class FakeAsyncRuntime:
             return None
         return result
 
+    def stats(self):
+        return len(self.submissions), 0, len(self.latest_results)
+
     def shutdown(self):
         return None
 
@@ -209,13 +212,24 @@ def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
         scheduler.add_request(request)
 
     scheduler.publish_plex()
-    epoch = scheduler.plex.epoch
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
     runtime.latest_results["schedule"] = (
         epoch,
         {
             "status": "success",
-            "decision": {"selected": [{"candidate_index": 1, "token_budget": 10}]},
-            "request_fields": {},
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [1], "token_budgets": [10]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
             "actions": [],
         },
     )
@@ -225,6 +239,278 @@ def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
 
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
     assert len(runtime.submissions) == submitted
+
+
+def test_plex_async_rejects_non_atomic_multi_request_selection():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [0, 1], "token_budgets": [10, 10]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {
+        requests[0].request_id,
+        requests[1].request_id,
+    }
+
+
+def test_plex_async_reports_progress_and_selection_enactment():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [0], "token_budgets": [10]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    scheduler_output = scheduler.schedule()
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+    scheduler.publish_plex()
+
+    feedback = [
+        event for channel, _epoch, event in runtime.submissions if channel == "feedback"
+    ][-1]
+    progress = next(
+        record
+        for record in feedback["context"]["records"]
+        if record["subject"]["kind"] == "request"
+    )
+    selection = next(
+        record
+        for record in feedback["context"]["records"]
+        if record["subject"]["kind"] == "schedule-selection"
+    )
+    assert progress["facts"]["committed_tokens"] == 10
+    assert progress["facts"]["service_tokens"] == 10
+    assert progress["facts"]["input_tokens"] == 9
+    assert progress["facts"]["output_tokens"] == 1
+    assert selection["facts"]["status"] == "enacted"
+    assert selection["facts"]["scheduled_tokens"] == 10
+
+
+def test_plex_async_rejects_request_field_mutation():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [1], "token_budgets": [10]},
+                    ]
+                },
+            },
+            "state_update": {
+                "shared": None,
+                "groups": [],
+                "requests": [
+                    {
+                        "request_id": requests[1].request_id,
+                        "fields": {"body": {"priority": -1}},
+                        "scratch": None,
+                    }
+                ],
+            },
+            "actions": [],
+        },
+    )
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {
+        requests[0].request_id,
+        requests[1].request_id,
+    }
+
+
+def test_plex_async_allows_policy_private_request_fields():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    fields = dict(scheduler.plex._canonical_fields[requests[1].request_id])
+    fields["last_hook"] = "schedule"
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [1], "token_budgets": [10]},
+                    ]
+                },
+            },
+            "state_update": {
+                "shared": None,
+                "groups": [],
+                "requests": [
+                    {
+                        "request_id": requests[1].request_id,
+                        "fields": fields,
+                        "scratch": None,
+                    }
+                ],
+            },
+            "actions": [],
+        },
+    )
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {requests[1].request_id: 10}
+
+
+def test_plex_async_cache_decision_is_one_shot_and_reported():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.publish_plex()
+    assert scheduler.plex._submit_cache(scheduler)
+    cache_epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "cache"
+    )
+    runtime.latest_results["cache"] = (
+        cache_epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "cache",
+                "plan": {"admissions": [], "reclaim": [0]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+
+    decision = scheduler.plex.cached_preemption()
+
+    assert decision is not None
+    assert decision.request_id == request.request_id
+    assert scheduler.plex.cached_preemption() is None
+    scheduler.plex.mark_cache_enacted(decision, request)
+    scheduler.publish_plex()
+    feedback = [
+        event for channel, _epoch, event in runtime.submissions if channel == "feedback"
+    ][-1]
+    cache_record = next(
+        record
+        for record in feedback["context"]["records"]
+        if record["subject"]["kind"] == "cache-object"
+    )
+    assert cache_record["facts"]["status"] == "reclaimed"
+
+
+@pytest.mark.parametrize("version", ["0.6.0", "0.6.9.dev1"])
+def test_plex_runtime_version_accepts_v0_6(version):
+    AsyncPlexPolicyController._validate_runtime_version(version)
+
+
+@pytest.mark.parametrize("version", ["0.5.9", "0.7.0"])
+def test_plex_runtime_version_rejects_incompatible_release(version):
+    with pytest.raises(RuntimeError, match="requires pie-plex"):
+        AsyncPlexPolicyController._validate_runtime_version(version)
 
 
 def test_plex_async_missing_plan_uses_native_scheduler():
@@ -267,7 +553,125 @@ def test_plex_async_feedback_is_coalesced_until_publish():
         event for channel, _epoch, event in runtime.submissions if channel == "feedback"
     ]
     assert len(feedback) == 1
-    assert feedback[0]["context"]["records"][0]["event"] == "finished"
+    assert feedback[0]["api_version"] == "pie.plex.engine@2"
+    assert feedback[0]["operation"] == "feedback"
+    assert feedback[0]["context"]["records"][0]["outcome"] == "cancelled"
+    assert feedback[0]["cleanup"]["requests"][0]["status"] == "cancelled"
+
+
+def test_plex_async_feedback_waits_for_ack_and_retries_state_conflict():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.publish_plex()
+    feedback_submissions = [
+        submission for submission in runtime.submissions if submission[0] == "feedback"
+    ]
+    assert len(feedback_submissions) == 1
+
+    scheduler.publish_plex()
+    assert (
+        len(
+            [
+                submission
+                for submission in runtime.submissions
+                if submission[0] == "feedback"
+            ]
+        )
+        == 1
+    )
+
+    first = feedback_submissions[0]
+    runtime.latest_results["feedback"] = (
+        first[1],
+        {
+            "status": "fallback",
+            "failure": {"kind": "state-conflict", "message": "retry"},
+        },
+    )
+    scheduler.publish_plex()
+    feedback_submissions = [
+        submission for submission in runtime.submissions if submission[0] == "feedback"
+    ]
+    assert len(feedback_submissions) == 2
+    assert (
+        feedback_submissions[0][2]["context"]["delivery_id"]
+        == feedback_submissions[1][2]["context"]["delivery_id"]
+    )
+
+
+def test_plex_async_sends_progress_before_terminal_cleanup():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    scheduler.plex = AsyncPlexPolicyController(
+        runtime,
+        model="facebook/opt-125m",
+        target_id="test",
+    )
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.publish_plex()
+    schedule_epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    runtime.latest_results["schedule"] = (
+        schedule_epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [0], "token_budgets": [10]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    scheduler.publish_plex()
+    feedback_submissions = [
+        submission for submission in runtime.submissions if submission[0] == "feedback"
+    ]
+    assert len(feedback_submissions) == 1
+    assert feedback_submissions[0][2]["cleanup"]["requests"] == []
+
+    runtime.latest_results["feedback"] = (
+        feedback_submissions[0][1],
+        {"status": "success"},
+    )
+    scheduler.publish_plex()
+    feedback_submissions = [
+        submission for submission in runtime.submissions if submission[0] == "feedback"
+    ]
+    assert len(feedback_submissions) == 2
+    assert feedback_submissions[1][2]["cleanup"]["requests"] == [
+        {"request_id": request.request_id, "status": "cancelled"}
+    ]
 
 
 def test_scheduler_stats_route_to_existing_output_client():

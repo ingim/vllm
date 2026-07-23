@@ -6,7 +6,9 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 PLEX = {
-    "logical_request_id": "workflow",
+    "request_id": "request",
+    "principal_id": "tenant",
+    "group_id": "workflow",
     "generation_id": 1,
     "terminal": False,
 }

@@ -284,8 +284,8 @@ class ResponsesRequest(OpenAIBaseModel):
     plex: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "PLEX logical-request metadata, including logical_request_id, "
-            "generation_id, terminal, completion_event, and policy metadata."
+            "PLEX request metadata, including request_id, principal_id, optional "
+            "group_id, generation_id, terminal, close_group, and policy metadata."
         ),
     )
     kv_transfer_params: dict[str, Any] | None = Field(

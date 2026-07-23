@@ -1298,7 +1298,7 @@ setup(
         ],
         # extra quantization plugin
         "extra-quant": ["vllm-gguf-plugin>=0.0.2"],
-        "plex": ["pie-plex>=0.5,<0.6"],
+        "plex": ["pie-plex>=0.6,<0.7"],
     },
     cmdclass=cmdclass,
     package_data=package_data,
