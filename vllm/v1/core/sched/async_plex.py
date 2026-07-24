@@ -1166,11 +1166,13 @@ class AsyncPlexPolicyController:
             "engine": "vllm",
             "model": self.model,
             "target_id": self.target_id,
+            "now_us": time.monotonic_ns() // 1000,
             "membership_epoch": self.epoch,
             "queue_depth": len(scheduler.waiting) + len(scheduler.skipped_waiting),
             "running_requests": len(scheduler.running),
             "free_kv_blocks": pool.get_num_free_blocks(),
             "total_kv_blocks": pool.num_gpu_blocks,
+            "total_kv_tokens": pool.num_gpu_blocks,
             "schedule_plan_age_ms": self._age_ms(self._last_schedule_outcome_at),
             "cache_plan_age_ms": self._age_ms(self._last_cache_outcome_at),
             "async_submitted": submitted,
@@ -1193,10 +1195,15 @@ class AsyncPlexPolicyController:
         request_id = self._engine_to_request[request.request_id]
         metadata = self._request_metadata.get(request_id, {})
         policy_facts = metadata.get("facts", {})
+        waiting_ms = max(int((time.time() - request.arrival_time) * 1000), 0)
         return {
             **policy_facts,
             "engine_request_id": request.request_id,
             "client_id": principal_id,
+            "queue_member": request.status != RequestStatus.RUNNING,
+            "scheduler_state": (
+                "running" if request.status == RequestStatus.RUNNING else "waiting"
+            ),
             "attained_service": request.num_computed_tokens,
             "service_tokens": request.num_computed_tokens,
             "dispatch_input_tokens": max(
@@ -1206,7 +1213,8 @@ class AsyncPlexPolicyController:
             "generated_tokens": len(request.output_token_ids),
             "preempted": request.num_preemptions > 0,
             "preemptions": request.num_preemptions,
-            "waiting_ms": max(int((time.time() - request.arrival_time) * 1000), 0),
+            "waiting_ms": waiting_ms,
+            "call_wait_us": waiting_ms * 1000,
             "cache_ready": request.num_computed_tokens > 0,
             "cached_tokens": request.num_computed_tokens,
         }
