@@ -1,6 +1,6 @@
 # PLEX serving policies
 
-PLEX loads an operator-provided v0.6 WebAssembly policy package into a bounded
+PLEX loads an operator-provided v0.7 WebAssembly policy package into a bounded
 worker beside the vLLM V1 scheduler. The scheduler never waits for Wasm, JSON,
 state access, or Python callbacks. It consumes an immutable cached schedule or
 cache plan and immediately uses native scheduling when a plan is missing,
@@ -8,8 +8,8 @@ stale, unavailable, or failed.
 
 ## Installation and startup
 
-Install the optional `pie-plex` 0.6 runtime, then pass a package. vLLM rejects
-runtime releases outside `>=0.6,<0.7` or an incomplete `AsyncRuntime` API.
+Install the optional `plex` 0.7 runtime, then pass a package. vLLM rejects
+runtime releases outside `>=0.7,<0.8` or an incomplete `AsyncRuntime` API.
 
 ```bash
 pip install "vllm[plex]"

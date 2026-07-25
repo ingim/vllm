@@ -515,14 +515,14 @@ def test_plex_async_cache_decision_is_one_shot_and_reported():
     assert cache_record["facts"]["status"] == "reclaimed"
 
 
-@pytest.mark.parametrize("version", ["0.6.0", "0.6.9.dev1"])
-def test_plex_runtime_version_accepts_v0_6(version):
+@pytest.mark.parametrize("version", ["0.7.0", "0.7.9.dev1"])
+def test_plex_runtime_version_accepts_v0_7(version):
     AsyncPlexPolicyController._validate_runtime_version(version)
 
 
-@pytest.mark.parametrize("version", ["0.5.9", "0.7.0"])
+@pytest.mark.parametrize("version", ["0.6.9", "0.8.0"])
 def test_plex_runtime_version_rejects_incompatible_release(version):
-    with pytest.raises(RuntimeError, match="requires pie-plex"):
+    with pytest.raises(RuntimeError, match="requires plex"):
         AsyncPlexPolicyController._validate_runtime_version(version)
 
 
@@ -601,7 +601,7 @@ def test_plex_async_feedback_is_coalesced_until_publish():
         event for channel, _epoch, event in runtime.submissions if channel == "feedback"
     ]
     assert len(feedback) == 1
-    assert feedback[0]["api_version"] == "pie.plex.engine@2"
+    assert feedback[0]["api_version"] == "plex.plex.engine@2"
     assert feedback[0]["operation"] == "feedback"
     assert feedback[0]["context"]["records"][0]["outcome"] == "cancelled"
     assert feedback[0]["cleanup"]["requests"][0]["status"] == "cancelled"

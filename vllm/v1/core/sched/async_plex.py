@@ -18,13 +18,13 @@ from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
-    from pie_plex import AsyncRuntime
+    from plex import AsyncRuntime
 
     from vllm.v1.core.sched.scheduler import Scheduler
 
-PLEX_API_VERSION = "pie.plex.engine@2"
-MIN_PIE_PLEX_VERSION = Version("0.6")
-MAX_PIE_PLEX_VERSION = Version("0.7")
+PLEX_API_VERSION = "plex.plex.engine@2"
+MIN_PLEX_VERSION = Version("0.7")
+MAX_PLEX_VERSION = Version("0.8")
 logger = init_logger(__name__)
 
 
@@ -154,18 +154,18 @@ class AsyncPlexPolicyController:
         target_id: str,
     ) -> AsyncPlexPolicyController:
         try:
-            from pie_plex import AsyncRuntime
+            from plex import AsyncRuntime
         except ImportError as error:
             raise ImportError(
-                "PLEX policy configured but pie-plex is not installed. "
-                "Install vLLM with the 'plex' extra or install pie-plex directly."
+                "PLEX policy configured but plex is not installed. "
+                "Install vLLM with the 'plex' extra or install plex directly."
             ) from error
         try:
-            version = distribution_version("pie-plex")
+            version = distribution_version("plex")
         except PackageNotFoundError as error:
             raise ImportError(
-                "PLEX policy configured but the pie-plex distribution metadata "
-                "is unavailable. Reinstall pie-plex 0.6.x."
+                "PLEX policy configured but the plex distribution metadata "
+                "is unavailable. Reinstall plex 0.7.x."
             ) from error
         cls._validate_runtime_version(version)
         required_methods = {
@@ -179,10 +179,10 @@ class AsyncPlexPolicyController:
         )
         if missing:
             raise RuntimeError(
-                "pie-plex 0.6.x AsyncRuntime is missing required methods: "
+                "plex 0.7.x AsyncRuntime is missing required methods: "
                 + ", ".join(missing)
             )
-        logger.info("Enabling PLEX with pie-plex %s", version)
+        logger.info("Enabling PLEX with plex %s", version)
         return cls(
             AsyncRuntime(policy, queue_capacity=256),
             model=model,
@@ -195,10 +195,10 @@ class AsyncPlexPolicyController:
         try:
             parsed = Version(version)
         except InvalidVersion as error:
-            raise RuntimeError(f"invalid pie-plex version {version!r}") from error
-        if not MIN_PIE_PLEX_VERSION <= parsed < MAX_PIE_PLEX_VERSION:
+            raise RuntimeError(f"invalid plex version {version!r}") from error
+        if not MIN_PLEX_VERSION <= parsed < MAX_PLEX_VERSION:
             raise RuntimeError(
-                f"vLLM PLEX requires pie-plex >=0.6,<0.7; found {version}"
+                f"vLLM PLEX requires plex >=0.7,<0.8; found {version}"
             )
 
     def register_request(self, request: Request) -> None:
@@ -1419,7 +1419,7 @@ class AsyncPlexPolicyController:
             or max_scratch_bytes <= 0
             or max_scratch_bytes > 2**64 - 1
         ):
-            raise ValueError("PLEX group limits exceed the v0.6 integer bounds")
+            raise ValueError("PLEX group limits exceed the v0.7 integer bounds")
         metadata = config.get("metadata")
         if metadata is None:
             metadata = {

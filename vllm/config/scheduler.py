@@ -122,7 +122,7 @@ class SchedulerConfig:
     plex_policy: str | None = None
     """Path to a PLEX ``.plexpkg`` policy package.
 
-    When set, the scheduler publishes typed PLEX v0.6 lifecycle snapshots to a
+    When set, the scheduler publishes typed PLEX v0.7 lifecycle snapshots to a
     bounded asynchronous worker. The scheduler consumes only cached plans and
     immediately uses native behavior when a plan is missing, stale, unavailable,
     or failed.
