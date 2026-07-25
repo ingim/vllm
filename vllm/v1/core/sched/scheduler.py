@@ -356,6 +356,7 @@ class Scheduler(SchedulerInterface):
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
                 self.scheduler_config.plex_policy,
+                self,
                 model=vllm_config.model_config.model,
                 target_id=f"dp-{self.parallel_config.data_parallel_index}",
             )
@@ -2596,7 +2597,7 @@ class Scheduler(SchedulerInterface):
 
     def publish_plex(self) -> None:
         if self.plex is not None:
-            self.plex.publish(self)
+            self.plex.publish()
 
     ########################################################################
     # KV Connector Related Methods

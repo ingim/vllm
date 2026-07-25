@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import json
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -27,7 +28,10 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.core.sched.async_plex import AsyncPlexPolicyController
+from vllm.v1.core.sched.async_plex import (
+    AsyncPlexPolicyController,
+    VllmEnginePort,
+)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -199,14 +203,22 @@ class FakeAsyncRuntime:
         return None
 
 
+def attach_plex(scheduler, runtime, model="facebook/opt-125m", target_id="test"):
+    """Attach a controller driven by `runtime` instead of a real policy."""
+    from plex.engine import PolicyController
+
+    port = VllmEnginePort(scheduler)
+    scheduler.plex = AsyncPlexPolicyController(
+        PolicyController(runtime, port, model=model, target_id=target_id),
+        port,
+    )
+    return scheduler.plex
+
+
 def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=2, num_tokens=10)
     for request in requests:
         scheduler.add_request(request)
@@ -244,11 +256,7 @@ def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
 def test_plex_async_rejects_non_atomic_multi_request_selection():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=2, num_tokens=10)
     for request in requests:
         scheduler.add_request(request)
@@ -287,11 +295,7 @@ def test_plex_async_rejects_non_atomic_multi_request_selection():
 def test_plex_async_reports_progress_and_selection_enactment():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1, num_tokens=10)[0]
     assert request.sampling_params is not None
     request.sampling_params.extra_args = {
@@ -366,11 +370,7 @@ def test_plex_async_reports_progress_and_selection_enactment():
 def test_plex_async_rejects_request_field_mutation():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=2, num_tokens=10)
     for request in requests:
         scheduler.add_request(request)
@@ -418,11 +418,7 @@ def test_plex_async_rejects_request_field_mutation():
 def test_plex_async_allows_policy_private_request_fields():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=2, num_tokens=10)
     for request in requests:
         scheduler.add_request(request)
@@ -432,7 +428,7 @@ def test_plex_async_allows_policy_private_request_fields():
         for channel, epoch, _event in reversed(runtime.submissions)
         if channel == "schedule"
     )
-    fields = dict(scheduler.plex._canonical_fields[requests[1].request_id])
+    fields = dict(scheduler.plex.controller._canonical_fields[requests[1].request_id])
     fields["last_hook"] = "schedule"
     runtime.latest_results["schedule"] = (
         epoch,
@@ -469,16 +465,12 @@ def test_plex_async_allows_policy_private_request_fields():
 def test_plex_async_cache_decision_is_one_shot_and_reported():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1, num_tokens=10)[0]
     scheduler.add_request(request)
     scheduler.schedule()
     scheduler.publish_plex()
-    assert scheduler.plex._submit_cache(scheduler)
+    assert scheduler.plex.controller._submit_cache()
     cache_epoch = next(
         epoch
         for channel, epoch, _event in reversed(runtime.submissions)
@@ -515,25 +507,10 @@ def test_plex_async_cache_decision_is_one_shot_and_reported():
     assert cache_record["facts"]["status"] == "reclaimed"
 
 
-@pytest.mark.parametrize("version", ["0.7.0", "0.7.9.dev1"])
-def test_plex_runtime_version_accepts_v0_7(version):
-    AsyncPlexPolicyController._validate_runtime_version(version)
-
-
-@pytest.mark.parametrize("version", ["0.6.9", "0.8.0"])
-def test_plex_runtime_version_rejects_incompatible_release(version):
-    with pytest.raises(RuntimeError, match="requires plex"):
-        AsyncPlexPolicyController._validate_runtime_version(version)
-
-
 def test_plex_async_missing_plan_uses_native_scheduler():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=2, num_tokens=10)
     for request in requests:
         scheduler.add_request(request)
@@ -550,11 +527,7 @@ def test_plex_async_missing_plan_uses_native_scheduler():
 def test_plex_async_merges_validated_policy_facts_below_host_facts():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1)[0]
     assert request.sampling_params is not None
     request.sampling_params.extra_args = {
@@ -585,11 +558,7 @@ def test_plex_async_merges_validated_policy_facts_below_host_facts():
 def test_plex_async_feedback_is_coalesced_until_publish():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1)[0]
     scheduler.add_request(request)
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -610,11 +579,7 @@ def test_plex_async_feedback_is_coalesced_until_publish():
 def test_plex_async_feedback_waits_for_ack_and_retries_state_conflict():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1)[0]
     scheduler.add_request(request)
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -658,11 +623,7 @@ def test_plex_async_feedback_waits_for_ack_and_retries_state_conflict():
 def test_plex_async_sends_progress_before_terminal_cleanup():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
-    scheduler.plex = AsyncPlexPolicyController(
-        runtime,
-        model="facebook/opt-125m",
-        target_id="test",
-    )
+    attach_plex(scheduler, runtime)
     request = create_requests(num_requests=1, num_tokens=10)[0]
     scheduler.add_request(request)
     scheduler.publish_plex()
@@ -720,6 +681,29 @@ def test_plex_async_sends_progress_before_terminal_cleanup():
     assert feedback_submissions[1][2]["cleanup"]["requests"] == [
         {"request_id": request.request_id, "status": "cancelled"}
     ]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PLEX_TEST_POLICY"), reason="PLEX_TEST_POLICY is not set"
+)
+def test_plex_port_passes_the_contract_conformance_harness():
+    """Drive this port through a real policy and a real host."""
+    from plex.engine.testing import conformance
+
+    from vllm.v1.core.sched.async_plex import VllmEnginePort
+
+    # Small enough that three resident requests put the pool under pressure,
+    # which is the only condition under which this port asks about the cache.
+    scheduler = create_scheduler(num_blocks=64, block_size=16)
+    for request in create_requests(num_requests=3, num_tokens=200):
+        scheduler.add_request(request)
+    scheduler.schedule()
+    port = VllmEnginePort(scheduler)
+    assert port.under_pressure()
+
+    report = conformance(port, os.environ["PLEX_TEST_POLICY"])
+
+    assert report.problems == [], report.problems
 
 
 def test_scheduler_stats_route_to_existing_output_client():
@@ -3716,6 +3700,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
 
     scheduler.perf_metrics = None
     scheduler.connector = None
+    scheduler.plex = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
