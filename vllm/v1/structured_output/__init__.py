@@ -137,6 +137,16 @@ class StructuredOutputManager:
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
                 )
+            elif backend == "gpugrammar":
+                from vllm.v1.structured_output.backend_gpugrammar import (
+                    GpuGrammarBackend,
+                )
+
+                self.backend = GpuGrammarBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
             elif backend == "guidance":
                 self.backend = GuidanceBackend(
                     self.vllm_config,

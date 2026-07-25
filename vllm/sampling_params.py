@@ -1010,6 +1010,11 @@ class SamplingParams(
         elif backend == "outlines":
             # outlines backend
             validate_structured_output_request_outlines(self)
+        elif backend == "gpugrammar":
+            # gpugrammar validates when it compiles the grammar, and reports
+            # what it cannot lower as a compile error rather than silently
+            # accepting the request, so there is nothing to check here.
+            pass
         elif backend == "lm-format-enforcer":
             # lm format enforcer backend
             if is_mistral_tokenizer(tokenizer):
