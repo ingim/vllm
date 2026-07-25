@@ -14,9 +14,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from plex.engine import (
+    NO_SIGNALS,
     CacheCapacity,
     CacheDecision,
     PolicyController,
+    RequestSignals,
     ScheduleCapacity,
     SchedulePlan,
 )
@@ -49,11 +51,17 @@ PlexCacheDecision = CacheDecision
 class VllmRequest:
     """One `Request`, answering the questions `plex.engine` asks."""
 
-    __slots__ = ("_request", "_scheduler")
+    __slots__ = ("_request", "_scheduler", "_signals")
 
-    def __init__(self, request: Request, scheduler: Scheduler) -> None:
+    def __init__(
+        self,
+        request: Request,
+        scheduler: Scheduler,
+        signals: RequestSignals | None = None,
+    ) -> None:
         self._request = request
         self._scheduler = scheduler
+        self._signals = signals if signals is not None else NO_SIGNALS
 
     @property
     def engine_id(self) -> str:
@@ -75,15 +83,19 @@ class VllmRequest:
 
     def facts(self) -> dict[str, Any]:
         request = self._request
+        signals = self._signals
         waiting_ms = max(int((time.time() - request.arrival_time) * 1000), 0)
         running = request.status == RequestStatus.RUNNING
+        prompt_tokens = request.num_prompt_tokens
+        hit = min(signals.lpm_hit_tokens, prompt_tokens)
+        uncached = prompt_tokens - hit
         return {
             "queue_member": not running,
             "scheduler_state": "running" if running else "waiting",
             "attained_service": request.num_computed_tokens,
             "service_tokens": request.num_computed_tokens,
             "dispatch_input_tokens": max(
-                request.num_prompt_tokens - request.num_computed_tokens, 0
+                prompt_tokens - request.num_computed_tokens, 0
             ),
             "generated_tokens": len(request.output_token_ids),
             "preempted": request.num_preemptions > 0,
@@ -91,14 +103,38 @@ class VllmRequest:
             "waiting_ms": waiting_ms,
             "call_wait_us": waiting_ms * 1000,
             "arrival_ms": int(request.arrival_time * 1000),
+            "arrival_seq": signals.arrival_seq,
             "cache_ready": request.num_computed_tokens > 0,
             "cached_tokens": request.num_computed_tokens,
+            "prompt_tokens": prompt_tokens,
+            "computation_length": prompt_tokens + len(request.output_token_ids),
+            "lpm_hit_tokens": hit,
+            "uncached_tokens": uncached,
+            # What is left to prefill after the cache, not after progress: a
+            # policy weighing admission wants the work the request will cost.
+            "new_prefill_tokens": max(
+                uncached - max(request.num_computed_tokens - hit, 0), 0
+            ),
+            "prefix_hit_ratio_ppm": (
+                hit * 1_000_000 // prompt_tokens if prompt_tokens else 0
+            ),
+            "current_queue_ms": 0 if running else waiting_ms,
+            "kv_overloaded": under_pressure(self._scheduler),
+            "now_ms": int(time.time() * 1000),
         }
 
     def cache_facts(self) -> dict[str, Any]:
+        request = self._request
         return {
             "actual_size_bytes": self.actual_size_bytes(),
             "leaf": True,
+            "cached_length": request.num_computed_tokens,
+            "computation_length": (
+                request.num_prompt_tokens + len(request.output_token_ids)
+            ),
+            "last_access_ms": self._signals.last_access_ms,
+            "state_kind": request.status.name.lower(),
+            "tier": "gpu",
         }
 
     def token_budget(self) -> int:
@@ -158,6 +194,42 @@ def reclaim_unit(scheduler: Scheduler) -> int:
     )
 
 
+def block_tokens(scheduler: Scheduler) -> int:
+    """Tokens held by one block of the largest KV cache group."""
+    return max(
+        (
+            group.kv_cache_spec.block_size
+            for group in scheduler.kv_cache_config.kv_cache_groups
+        ),
+        default=1,
+    )
+
+
+def under_pressure(scheduler: Scheduler) -> bool:
+    pool = scheduler.kv_cache_manager.block_pool
+    return pool.num_gpu_blocks > 0 and (
+        pool.get_num_free_blocks() * 2 <= pool.num_gpu_blocks
+    )
+
+
+def prefix_hit_tokens(scheduler: Scheduler, request: Request) -> int:
+    """Prompt tokens already in the prefix cache, read without disturbing it.
+
+    vLLM answers this itself, but only inside the scheduling loop and only
+    for the request it has decided to run -- and `take_prefill_stats` then
+    consumes the answer. A policy choosing *which* request to run needs it
+    one step earlier, so ask the coordinator directly. The lookup walks the
+    block-hash table and takes no references, so it is safe to repeat.
+    """
+    manager = scheduler.kv_cache_manager
+    if not manager.prefix_cache_lookup_enabled(request):
+        return 0
+    _, hit_tokens, _ = manager.coordinator.find_longest_cache_hit(
+        request.block_hashes, max(request.num_tokens - 1, 0)
+    )
+    return hit_tokens
+
+
 class VllmEnginePort:
     """The scheduler, seen through the contract's vocabulary."""
 
@@ -169,9 +241,35 @@ class VllmEnginePort:
 
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
+        self._signals: dict[str, RequestSignals] = {}
+        self._arrivals = 0
+        self._probed_tokens = 0
+        self._hit_tokens = 0
+
+    def observe(self, request: Request) -> RequestSignals:
+        """Record what only arrival order and the cache-at-arrival can say."""
+        hit = prefix_hit_tokens(self.scheduler, request)
+        self._arrivals += 1
+        self._probed_tokens += request.num_prompt_tokens
+        self._hit_tokens += min(hit, request.num_prompt_tokens)
+        signals = RequestSignals(
+            arrival_seq=self._arrivals - 1, lpm_hit_tokens=hit
+        )
+        self._signals[request.request_id] = signals
+        return signals
+
+    def touch(self, request: Request) -> None:
+        signals = self._signals.get(request.request_id)
+        if signals is not None:
+            signals.touch()
+
+    def forget(self, request_id: str) -> None:
+        self._signals.pop(request_id, None)
 
     def view(self, request: Request) -> VllmRequest:
-        return VllmRequest(request, self.scheduler)
+        return VllmRequest(
+            request, self.scheduler, self._signals.get(request.request_id)
+        )
 
     def candidates(self) -> list[VllmRequest]:
         scheduler = self.scheduler
@@ -189,14 +287,11 @@ class VllmEnginePort:
             ):
                 continue
             seen.add(request.request_id)
-            candidates.append(VllmRequest(request, scheduler))
+            candidates.append(self.view(request))
         return candidates
 
     def residents(self) -> list[VllmRequest]:
-        return [
-            VllmRequest(request, self.scheduler)
-            for request in self.scheduler.running
-        ]
+        return [self.view(request) for request in self.scheduler.running]
 
     def capacity(self) -> ScheduleCapacity:
         scheduler = self.scheduler
@@ -225,21 +320,39 @@ class VllmEnginePort:
         )
 
     def under_pressure(self) -> bool:
-        pool = self.scheduler.kv_cache_manager.block_pool
-        return (
-            pool.num_gpu_blocks > 0
-            and pool.get_num_free_blocks() * 2 <= pool.num_gpu_blocks
-        )
+        return under_pressure(self.scheduler)
 
     def engine_facts(self) -> dict[str, Any]:
         scheduler = self.scheduler
         pool = scheduler.kv_cache_manager.block_pool
+        free_blocks = pool.get_num_free_blocks()
+        total_blocks = pool.num_gpu_blocks
+        page_bytes = reclaim_unit(scheduler)
+        per_block = block_tokens(scheduler)
         return {
             "queue_depth": len(scheduler.waiting) + len(scheduler.skipped_waiting),
             "running_requests": len(scheduler.running),
-            "free_kv_blocks": pool.get_num_free_blocks(),
-            "total_kv_blocks": pool.num_gpu_blocks,
-            "total_kv_tokens": pool.num_gpu_blocks,
+            "batch_size": len(scheduler.running),
+            "max_batch_size": scheduler.max_num_running_reqs,
+            "max_total_tokens": scheduler.max_num_scheduled_tokens,
+            "free_kv_blocks": free_blocks,
+            "total_kv_blocks": total_blocks,
+            "free_kv_tokens": free_blocks * per_block,
+            "total_kv_tokens": total_blocks * per_block,
+            "used_kv_ppm": (
+                (total_blocks - free_blocks) * 1_000_000 // total_blocks
+                if total_blocks
+                else 0
+            ),
+            "memory_capacity": total_blocks * page_bytes,
+            "active_kv_bytes": (total_blocks - free_blocks) * page_bytes,
+            "hit_ratio_ppm": (
+                self._hit_tokens * 1_000_000 // self._probed_tokens
+                if self._probed_tokens
+                else 0
+            ),
+            "kv_overloaded": under_pressure(scheduler),
+            "now_ms": int(time.time() * 1000),
         }
 
 
@@ -291,6 +404,7 @@ class AsyncPlexPolicyController:
         return self.controller.tracks(engine_id)
 
     def register_request(self, request: Request) -> None:
+        self.port.observe(request)
         self.controller.register_request(self.port.view(request))
 
     def mark_scheduled(
@@ -307,6 +421,7 @@ class AsyncPlexPolicyController:
         committed_tokens: int,
         output_tokens: int,
     ) -> None:
+        self.port.touch(request)
         self.controller.mark_progress(
             self.port.view(request),
             committed_tokens=committed_tokens,
@@ -318,6 +433,7 @@ class AsyncPlexPolicyController:
 
     def mark_finished(self, request: Request, reason: str) -> None:
         self.controller.mark_finished(self.port.view(request), reason)
+        self.port.forget(request.request_id)
 
     def mark_cache_enacted(
         self, decision: CacheDecision, preempted: Request | None

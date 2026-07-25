@@ -507,6 +507,102 @@ def test_plex_async_cache_decision_is_one_shot_and_reported():
     assert cache_record["facts"]["status"] == "reclaimed"
 
 
+def test_plex_publishes_only_facts_the_contract_defines():
+    """A misspelt fact reads as zero to a policy, so catch it here instead.
+
+    `unwrap_or(0)` is how every policy reads a fact, which makes a name the
+    engine got wrong indistinguishable from a signal that is genuinely zero:
+    the policy keeps running and quietly stops discriminating.
+    """
+    from plex.engine import check_facts
+
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    port = scheduler.plex.port
+    check_facts(port.engine_facts(), "engine", where="vllm")
+    for view in port.candidates():
+        check_facts(view.facts(), "request", where="vllm")
+        check_facts(view.cache_facts(), "cache", where="vllm")
+
+
+def test_plex_reports_arrival_order_and_engine_capacity():
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=3, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    port = scheduler.plex.port
+    by_id = {view.engine_id: view.facts() for view in port.candidates()}
+    assert [by_id[request.request_id]["arrival_seq"] for request in requests] == [
+        0,
+        1,
+        2,
+    ]
+
+    facts = by_id[requests[0].request_id]
+    assert facts["prompt_tokens"] == 10
+    assert facts["computation_length"] == 10
+    assert facts["uncached_tokens"] == 10
+    assert facts["new_prefill_tokens"] == 10
+    assert facts["current_queue_ms"] >= 0
+
+    engine = port.engine_facts()
+    assert engine["queue_depth"] == 3
+    assert engine["batch_size"] == 0
+    assert engine["max_batch_size"] == 16
+    assert engine["max_total_tokens"] == 8192
+    assert engine["total_kv_tokens"] > engine["free_kv_tokens"] * 0
+    assert 0 <= engine["used_kv_ppm"] <= 1_000_000
+    assert engine["memory_capacity"] > 0
+    assert engine["now_ms"] > 0
+
+
+def test_plex_reports_prefix_cache_hit_before_the_request_is_scheduled():
+    """The hit has to be readable while the request is still a candidate.
+
+    vLLM computes it inside the scheduling loop, for the request it has
+    already chosen, and `take_prefill_stats` then consumes it -- which is one
+    step too late for a policy deciding *which* request to run.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=16)
+    attach_plex(scheduler, runtime)
+    first, second = create_requests(
+        num_requests=2, num_tokens=64, same_prompt=True, block_size=16
+    )
+
+    scheduler.add_request(first)
+    scheduler_output = scheduler.schedule()
+    model_output = ModelRunnerOutput(
+        req_ids=[first.request_id],
+        req_id_to_index={first.request_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    scheduler.add_request(second)
+
+    facts = next(
+        view.facts()
+        for view in scheduler.plex.port.candidates()
+        if view.engine_id == second.request_id
+    )
+    assert facts["lpm_hit_tokens"] > 0
+    assert facts["uncached_tokens"] == 64 - facts["lpm_hit_tokens"]
+    assert facts["prefix_hit_ratio_ppm"] > 0
+    assert scheduler.plex.port.engine_facts()["hit_ratio_ppm"] > 0
+
+
 def test_plex_async_missing_plan_uses_native_scheduler():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()
