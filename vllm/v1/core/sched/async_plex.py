@@ -245,6 +245,7 @@ class VllmEnginePort:
         self._arrivals = 0
         self._probed_tokens = 0
         self._hit_tokens = 0
+        self._pending_finish: set[str] = set()
 
     def observe(self, request: Request) -> RequestSignals:
         """Record what only arrival order and the cache-at-arrival can say."""
@@ -321,6 +322,85 @@ class VllmEnginePort:
 
     def under_pressure(self) -> bool:
         return under_pressure(self.scheduler)
+
+    # --- mechanics -----------------------------------------------------------
+    #
+    # Only what vLLM really performs. Notably absent:
+    #
+    #   schedule.atomic-enqueue@1  a guarantee, and vLLM cannot give it: the
+    #                              running loop stops on the token budget, so a
+    #                              selection can be admitted in part. This is
+    #                              the same reason `max_requests_per_selection`
+    #                              is 1.
+    #   request.pause@1            vLLM preempts on its own terms and has no
+    #                              entry point to park a named request with its
+    #                              state preserved.
+    #   cache.prefetch@1           no API to warm a prefix that is not attached
+    #   cache.move@1               to a request already in the engine.
+    #   request.rebalance@1        one engine, nowhere to rebalance to.
+    mechanics = ("request.finish@1", "group.cancel@1")
+
+    def enact(self, method: str, args: dict[str, Any]) -> bool:
+        """Accept a finish or cancel, to be applied before the next decision.
+
+        The work is queued rather than done here. `enact` is reached from
+        inside `Scheduler.schedule`, and `finish_requests` rebinds
+        `self.running`; doing that under the running loop would corrupt the
+        index it walks. Draining at the top of `poll_schedule` applies the
+        action before any request is looked at, which is the earliest point it
+        can take effect and still be safe.
+        """
+        if method == "plex.request.finish@1":
+            request_id = args.get("request_id")
+            if not isinstance(request_id, str) or args.get("disposition") not in (
+                "cancelled",
+                "completed",
+            ):
+                return False
+            return self._stage_finish([request_id])
+        if method == "plex.group.cancel@1":
+            group_id = args.get("group_id")
+            if not isinstance(group_id, str) or args.get("propagation") not in (
+                "group-only",
+                "live-requests",
+            ):
+                return False
+            if args.get("propagation") == "group-only":
+                # Nothing to do in the engine: the group has no engine-side
+                # existence beyond its live requests, so cancelling the group
+                # without them is a policy-side bookkeeping change.
+                return True
+            members = args.get("request_ids")
+            if not isinstance(members, list):
+                return False
+            return self._stage_finish(
+                [member for member in members if isinstance(member, str)]
+            )
+        return False
+
+    def _stage_finish(self, request_ids: list[str]) -> bool:
+        staged = [
+            request_id
+            for request_id in request_ids
+            if (request := self.scheduler.requests.get(request_id)) is not None
+            and not request.is_finished()
+        ]
+        self._pending_finish.update(staged)
+        # An action naming only requests the engine no longer has is not a
+        # failure: the policy acted on a view one step old, and the outcome it
+        # asked for already holds.
+        return True
+
+    def drain_actions(self) -> int:
+        """Apply staged finishes. Safe only outside the scheduler's loops."""
+        if not self._pending_finish:
+            return 0
+        request_ids = sorted(self._pending_finish)
+        self._pending_finish.clear()
+        finished = self.scheduler.finish_requests(
+            request_ids, RequestStatus.FINISHED_ABORTED
+        )
+        return len(finished)
 
     def engine_facts(self) -> dict[str, Any]:
         scheduler = self.scheduler
@@ -444,7 +524,13 @@ class AsyncPlexPolicyController:
         self.controller.publish()
 
     def poll_schedule(self) -> SchedulePlan | None:
-        return self.controller.poll_schedule()
+        plan = self.controller.poll_schedule()
+        # Actions staged while polling are applied here, before `schedule`
+        # looks at a single request. Anything that arrived on the cache
+        # channel mid-loop waits for the next step, which is the earliest
+        # moment `finish_requests` can rebind `self.running` safely.
+        self.port.drain_actions()
+        return plan
 
     def cached_preemption(self) -> CacheDecision | None:
         return self.controller.cached_reclaim()

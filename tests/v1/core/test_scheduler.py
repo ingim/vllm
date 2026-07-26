@@ -6100,3 +6100,70 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_plex_port_negotiates_only_what_vllm_enacts():
+    """A mechanic vLLM cannot honour must not be offered to the policy.
+
+    `schedule.atomic-enqueue@1` is the one worth pinning: the running loop
+    stops on the token budget, so a selection can be admitted in part. The
+    same fact is already recorded as `max_requests_per_selection == 1`, and
+    the two must not drift apart.
+    """
+    port = VllmEnginePort(create_scheduler())
+    assert set(port.mechanics) == {"request.finish@1", "group.cancel@1"}
+    assert "schedule.atomic-enqueue@1" not in port.mechanics
+    assert port.max_requests_per_selection == 1
+
+
+def test_plex_finish_action_aborts_the_request_before_the_running_loop():
+    """A staged finish reaches vLLM, and does so at a point that is safe.
+
+    `finish_requests` rebinds `self.running`, so enacting under the running
+    loop would corrupt the index it walks. Draining in `poll_schedule` applies
+    the action before any request is looked at, which is what makes the
+    aborted request absent from this very step's output rather than the next.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    doomed = requests[0].request_id
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {"selections": [{"requests": [1], "token_budgets": [10]}]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [
+                {
+                    "id": 1,
+                    "method": "plex.request.finish@1",
+                    "args": {
+                        "request_id": doomed,
+                        "disposition": "cancelled",
+                        "idempotency_key": "abort-1",
+                    },
+                }
+            ],
+        },
+    )
+
+    output = scheduler.schedule()
+
+    assert requests[0].is_finished(), "the staged finish never reached vLLM"
+    assert doomed not in output.num_scheduled_tokens
+    # The plan is enacted too: an action does not cost the plan it came with.
+    assert output.num_scheduled_tokens == {requests[1].request_id: 10}
