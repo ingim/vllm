@@ -197,6 +197,25 @@ class StructuredOutputManager:
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
     ) -> None:
         assert self._grammar_bitmask is not None
+        # A backend that computes masks on the accelerator wants the whole
+        # batch at once: filling row by row would launch a kernel per request
+        # and give it one sequence of parallelism, which is the opposite of
+        # what it is for.
+        filler = getattr(self.backend, "fill_bitmasks", None)
+        if filler is not None:
+            batch = list(batch)
+            filler(
+                [
+                    (grammar, index)
+                    for grammar, index, apply in batch
+                    if apply and not grammar.is_terminated()
+                ],
+                self._grammar_bitmask,
+            )
+            for grammar, index, apply in batch:
+                if not apply or grammar.is_terminated():
+                    self._grammar_bitmask[index].fill_(self._full_mask)
+            return
         for grammar, index, apply_bitmask in batch:
             if apply_bitmask and not grammar.is_terminated():
                 grammar.fill_bitmask(self._grammar_bitmask, index)
@@ -243,7 +262,28 @@ class StructuredOutputManager:
 
         # Optimized parallel filling of bitmasks for
         # non-spec, large-batch-size cases
-        if (
+        device_filler = getattr(self.backend, "fill_bitmasks", None)
+        if device_filler is not None and max_num_spec_tokens == 0:
+            # The backend fills on the accelerator, so it wants the batch whole:
+            # splitting it into chunks for a thread pool would launch a kernel
+            # per chunk and hand each one a fraction of the parallelism.
+            batch = []
+            for req_id in structured_output_request_ids:
+                request = requests[req_id]
+                structured_output_request = request.structured_output_request
+                if TYPE_CHECKING:
+                    assert structured_output_request is not None
+                    assert structured_output_request.grammar is not None
+                batch.append(
+                    (
+                        structured_output_request.grammar,
+                        cumulative_index,
+                        self.should_fill_bitmask(request),
+                    )
+                )
+                cumulative_index += 1
+            self._fill_bitmasks(batch)
+        elif (
             len(structured_output_request_ids) > self.fill_bitmask_parallel_threshold
             and max_num_spec_tokens == 0
         ):

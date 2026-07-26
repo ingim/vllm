@@ -48,6 +48,7 @@ class GpuGrammarGrammar(StructuredOutputGrammar):
     matcher: object
     words: int
     stop_token_ids: list[int]
+    device: object = None
     _terminated: bool = field(default=False, repr=False)
     _processed: int = field(default=0, repr=False)
 
@@ -91,9 +92,13 @@ class GpuGrammarGrammar(StructuredOutputGrammar):
         self._terminated = False
 
     def fill_bitmask(self, bitmask: torch.Tensor, batch_index: int) -> None:
+        """Fill one row. The batched path below is the one that matters."""
         row = bitmask[batch_index]
         row.zero_()
         self.matcher.fill_bitmask(row)
+        self._allow_stops(row)
+
+    def _allow_stops(self, row: torch.Tensor) -> None:
         # vLLM stops on a stop token, so it has to remain reachable once the
         # document is complete.
         if self.matcher.can_terminate():
@@ -122,6 +127,16 @@ class GpuGrammarBackend(StructuredOutputBackend):
         ]
         self.words = (self.vocab_size + 31) // 32
         self.compiled: dict[tuple, object] = {}
+        self.device: dict[tuple, object] = {}
+        self.batches: dict[int, object] = {}
+        try:
+            from gpu_lr1 import device_parser
+
+            self.device_parser = device_parser
+        except Exception:  # noqa: BLE001
+            # Without the device kernels the CPU matcher still answers; the
+            # difference is where the work happens, not whether it is correct.
+            self.device_parser = None
 
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
@@ -131,11 +146,58 @@ class GpuGrammarBackend(StructuredOutputBackend):
         if compiled is None:
             compiled = self._compile(request_type, grammar_spec)
             self.compiled[key] = compiled
+            if self.device_parser is not None:
+                self.device[key] = self.device_parser.DeviceGrammar(compiled)
         return GpuGrammarGrammar(
             matcher=compiled.matcher(32),
             words=compiled.bitset_words,
             stop_token_ids=self.stop_token_ids,
+            device=self.device.get(key),
         )
+
+    def fill_bitmasks(
+        self, batch: list[tuple[StructuredOutputGrammar, int]], bitmask: torch.Tensor
+    ) -> None:
+        """Fill every row of this step, on the accelerator where possible.
+
+        Requests sharing a grammar share its device tables, so they are grouped
+        and each group is one kernel launch over its sequences. What comes back
+        is copied into the bitmask vLLM expects; that copy is the interface, not
+        the design — the mask is already where the sampler wants it, and a
+        backend allowed to hand vLLM a device tensor would skip it.
+        """
+        import torch as _torch
+
+        by_grammar: dict[int, list[tuple[GpuGrammarGrammar, int]]] = {}
+        for grammar, index in batch:
+            if grammar.device is None:
+                grammar.fill_bitmask(bitmask, index)
+                continue
+            by_grammar.setdefault(id(grammar.device), []).append((grammar, index))
+
+        for entries in by_grammar.values():
+            device = entries[0][0].device
+            rows = self._batch_for(device, len(entries))
+            rows.set_batch_configurations(
+                {
+                    row: grammar.matcher.configurations()
+                    for row, (grammar, _) in enumerate(entries)
+                }
+            )
+            host = rows.fill_mask()[: len(entries)].to("cpu", non_blocking=False)
+            for row, (grammar, index) in enumerate(entries):
+                bitmask[index].copy_(host[row])
+                grammar._allow_stops(bitmask[index])
+        del _torch
+
+    def _batch_for(self, device, size: int):
+        """A device batch big enough for `size` sequences, reused across steps."""
+        cached = self.batches.get(id(device))
+        if cached is None or cached.batch < size:
+            cached = device.new_batch(max(size, 8))
+            self.batches[id(device)] = cached
+        cached.config_count.fill_(1)
+        return cached
 
     def _compile(self, request_type: StructuredOutputOptions, grammar_spec: str):
         if request_type == StructuredOutputOptions.JSON:
