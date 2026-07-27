@@ -17,6 +17,8 @@ the `if/elif` edit in `vllm/v1/structured_output/__init__.py`.
 from __future__ import annotations
 
 import json
+import os
+import threading
 from dataclasses import dataclass, field
 
 import torch
@@ -49,6 +51,7 @@ class GpuGrammarGrammar(StructuredOutputGrammar):
     words: int
     stop_token_ids: list[int]
     device: object = None
+    grammar_id: int = 0
     _terminated: bool = field(default=False, repr=False)
     _processed: int = field(default=0, repr=False)
 
@@ -127,8 +130,20 @@ class GpuGrammarBackend(StructuredOutputBackend):
         ]
         self.words = (self.vocab_size + 31) // 32
         self.compiled: dict[tuple, object] = {}
-        self.device: dict[tuple, object] = {}
-        self.batches: dict[int, object] = {}
+        # One arena for every schema the engine has seen, rather than one set of
+        # tables per schema: a batch under many schemas is then one launch.
+        self.pool: object = None
+        self.grammar_ids: dict[tuple, int] = {}
+        self.batch: object = None
+        self.max_num_seqs = max(
+            8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
+        )
+        # vLLM compiles grammars on a thread pool, so two requests with
+        # different schemas reach `compile_grammar` at once. Admission hands out
+        # the next index and appends to shared arrays, and the cache is a
+        # check-then-act, so without this two schemas take the same index and
+        # one of them is masked against the other's tables.
+        self.lock = threading.Lock()
         try:
             from gpu_lr1 import device_parser
 
@@ -142,62 +157,144 @@ class GpuGrammarBackend(StructuredOutputBackend):
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         key = (request_type, grammar_spec)
+        # Compiling is the expensive part and needs no lock; only publishing the
+        # result and taking an index do. A schema compiled twice under a race is
+        # wasted work, not a wrong answer.
         compiled = self.compiled.get(key)
         if compiled is None:
             compiled = self._compile(request_type, grammar_spec)
-            self.compiled[key] = compiled
-            if self.device_parser is not None:
-                self.device[key] = self.device_parser.DeviceGrammar(compiled)
+        with self.lock:
+            existing = self.compiled.get(key)
+            if existing is None:
+                self.compiled[key] = compiled
+                if self.device_parser is not None:
+                    if self.pool is None:
+                        self.pool = self.device_parser.DeviceGrammar()
+                    self.grammar_ids[key] = self.pool.admit(compiled)
+            else:
+                compiled = existing
+            pool = self.pool
+            identifier = self.grammar_ids.get(key, 0)
+        if pool is not None:
+            # Compiling happens when a request is admitted, which is before any
+            # step it takes part in - so this is where the kernels get built.
+            # Left to the first fill, Triton would compile inside a decode step
+            # and vLLM would rightly call it a latency spike.
+            self._batch_for(self.max_num_seqs)
         return GpuGrammarGrammar(
             matcher=compiled.matcher(32),
             words=compiled.bitset_words,
             stop_token_ids=self.stop_token_ids,
-            device=self.device.get(key),
+            device=pool,
+            grammar_id=identifier,
         )
 
     def fill_bitmasks(
         self, batch: list[tuple[StructuredOutputGrammar, int]], bitmask: torch.Tensor
     ) -> None:
-        """Fill every row of this step, on the accelerator where possible.
+        """Fill every row of this step in one launch.
 
-        Requests sharing a grammar share its device tables, so they are grouped
-        and each group is one kernel launch over its sequences. What comes back
-        is copied into the bitmask vLLM expects; that copy is the interface, not
-        the design — the mask is already where the sampler wants it, and a
-        backend allowed to hand vLLM a device tensor would skip it.
+        The tables of every schema live in one arena and a sequence carries the
+        index of the one it is under, so a batch under a dozen different schemas
+        is a single launch rather than a dozen. That is the shape a serving
+        batch has: requests bring their own schemas and the mixture changes
+        every step.
+
+        What comes back is copied into the bitmask vLLM expects, and that copy
+        is the interface rather than the design - the mask is already where the
+        sampler wants it, and a backend allowed to hand vLLM a device tensor
+        would skip it.
         """
-        import torch as _torch
-
-        by_grammar: dict[int, list[tuple[GpuGrammarGrammar, int]]] = {}
+        rows = [(g, i) for g, i in batch if g.device is not None]
         for grammar, index in batch:
             if grammar.device is None:
                 grammar.fill_bitmask(bitmask, index)
-                continue
-            by_grammar.setdefault(id(grammar.device), []).append((grammar, index))
+        if not rows:
+            return
 
-        for entries in by_grammar.values():
-            device = entries[0][0].device
-            rows = self._batch_for(device, len(entries))
-            rows.set_batch_configurations(
-                {
-                    row: grammar.matcher.configurations()
-                    for row, (grammar, _) in enumerate(entries)
-                }
-            )
-            host = rows.fill_mask()[: len(entries)].to("cpu", non_blocking=False)
-            for row, (grammar, index) in enumerate(entries):
-                bitmask[index].copy_(host[row])
-                grammar._allow_stops(bitmask[index])
-        del _torch
+        device = self._batch_for(len(rows))
+        device.set_grammars(
+            [grammar.grammar_id for grammar, _ in rows]
+            + [0] * (device.batch - len(rows))
+        )
+        # The matchers go straight to the packer rather than through a dict of
+        # Python configuration lists: at batch 512 that is 352 us against 1,373.
+        device.set_matchers([grammar.matcher for grammar, _ in rows])
+        host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+        # vLLM's bitmask spans the model's padded vocabulary and ours spans the
+        # tokenizer's, so the rows differ in width. The tail is padding rather
+        # than tokens, and a row is written wholesale, so it has to be cleared
+        # or the padding would be left allowed from whatever was there before.
+        width = host.shape[1]
+        for row, (grammar, index) in enumerate(rows):
+            bitmask[index, :width].copy_(host[row])
+            bitmask[index, width:].zero_()
+            grammar._allow_stops(bitmask[index])
+        if os.environ.get("GPUGRAMMAR_VERIFY"):
+            self._verify(rows, host)
 
-    def _batch_for(self, device, size: int):
-        """A device batch big enough for `size` sequences, reused across steps."""
-        cached = self.batches.get(id(device))
-        if cached is None or cached.batch < size:
-            cached = device.new_batch(max(size, 8))
-            self.batches[id(device)] = cached
-        cached.config_count.fill_(1)
-        return cached
+    def _verify(self, rows, host) -> None:
+        """Compare what the device produced against the matcher, row by row.
+
+        Only for finding out where a serving-path disagreement comes from; it is
+        a device-to-host copy per row and has no place in a decode loop.
+        """
+        reference = torch.zeros(host.shape[1], dtype=torch.int32)
+        for row, (grammar, index) in enumerate(rows):
+            reference.zero_()
+            grammar.matcher.fill_bitmask(reference)
+            if not torch.equal(host[row], reference):
+                extra = int(((host[row] & ~reference) != 0).sum())
+                missing = int(((reference & ~host[row]) != 0).sum())
+                print(
+                    f"GPUGRAMMAR row {row} (bitmask {index}, grammar "
+                    f"{grammar.grammar_id}): {extra} words with extra bits, "
+                    f"{missing} with missing",
+                    flush=True,
+                )
+                solo = self.pool.new_batch(1)
+                solo.set_grammars([grammar.grammar_id])
+                solo.set_batch_configurations({0: grammar.matcher.configurations()})
+                alone = solo.fill_mask()[0].cpu()
+                print(
+                    "GPUGRAMMAR   same row computed alone: "
+                    + ("agrees with the batch" if torch.equal(alone, host[row])
+                       else "DIFFERS from the batch")
+                    + "; alone vs matcher: "
+                    + ("agrees" if torch.equal(alone, reference) else "DIFFERS"),
+                    flush=True,
+                )
+                print(
+                    "GPUGRAMMAR state "
+                    + json.dumps(
+                        [
+                            {
+                                "row": other,
+                                "grammar": g.grammar_id,
+                                "configurations": g.matcher.configurations(),
+                            }
+                            for other, (g, _) in enumerate(rows)
+                        ]
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(3)
+
+    def _batch_for(self, size: int):
+        """A device batch big enough for `size` sequences, reused across steps.
+
+        Rebuilt when the pool has moved under it as well as when it is too
+        small: admitting a grammar can raise a ceiling, and buffers sized
+        against the old one are too small for the new.
+        """
+        stale = self.batch is not None and self.batch.pool_revision != self.pool.revision
+        if self.batch is None or self.batch.batch < size or stale:
+            self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
+            # Triton compiles on first use, and first use would otherwise be in
+            # the middle of a step.
+            self.batch.warmup()
+        self.batch.config_count.fill_(1)
+        return self.batch
 
     def _compile(self, request_type: StructuredOutputOptions, grammar_spec: str):
         if request_type == StructuredOutputOptions.JSON:
