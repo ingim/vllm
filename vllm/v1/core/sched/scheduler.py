@@ -488,7 +488,11 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            if plex_plan is not None and not plex_plan.selects(request.request_id):
+            if (
+                plex_plan is not None
+                and plex_plan.saw(request.request_id)
+                and not plex_plan.selects(request.request_id)
+            ):
                 req_index += 1
                 continue
 
@@ -2076,14 +2080,21 @@ class Scheduler(SchedulerInterface):
             return request_queue, request_queue.peek_request()
 
         selected: tuple[int, RequestQueue, Request] | None = None
+        unseen: tuple[RequestQueue, Request] | None = None
         for request_queue in (self.waiting, self.skipped_waiting):
             for request in request_queue:
                 rank = plex_plan.rank(request.request_id)
                 if rank is not None and (selected is None or rank < selected[0]):
                     selected = (rank, request_queue, request)
-        if selected is None:
-            return None
-        return selected[1], selected[2]
+                if unseen is None and not plex_plan.saw(request.request_id):
+                    unseen = (request_queue, request)
+        if selected is not None:
+            return selected[1], selected[2]
+        # The plan ranks nothing runnable. A request it never saw carries no
+        # decision, so admitting it natively is not overriding the policy --
+        # whereas refusing to admit anything would starve every arrival that
+        # landed after the plan was submitted.
+        return unseen
 
     @staticmethod
     def _remove_waiting_request(request_queue: RequestQueue, request: Request) -> None:

@@ -289,6 +289,10 @@ class InprocClient(EngineCoreClient):
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
+        # Mirrors EngineCore._process_engine_step: without this the policy is
+        # never consulted on the in-process path and the engine silently falls
+        # back to native scheduling.
+        self.engine_core.scheduler.publish_plex()
         return outputs and outputs.get(0) or EngineCoreOutputs()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
