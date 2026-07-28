@@ -143,7 +143,12 @@ class GpuGrammarBackend(StructuredOutputBackend):
         # the next index and appends to shared arrays, and the cache is a
         # check-then-act, so without this two schemas take the same index and
         # one of them is masked against the other's tables.
-        self.lock = threading.Lock()
+        # Reentrant, because a fill holds it across `_batch_for`, which takes
+        # it too. vLLM compiles grammars on a thread pool while decode steps
+        # run, and admitting one can *move* the arena - a fill that checked the
+        # revision a moment earlier then launches against freed memory. It is
+        # rare and it is a wrong mask, which is the worst combination.
+        self.lock = threading.RLock()
         try:
             from gpu_lr1 import device_parser
 
@@ -212,15 +217,21 @@ class GpuGrammarBackend(StructuredOutputBackend):
         if not rows:
             return
 
-        device = self._batch_for(len(rows))
-        device.set_grammars(
-            [grammar.grammar_id for grammar, _ in rows]
-            + [0] * (device.batch - len(rows))
-        )
-        # The matchers go straight to the packer rather than through a dict of
-        # Python configuration lists: at batch 512 that is 352 us against 1,373.
-        device.set_matchers([grammar.matcher for grammar, _ in rows])
-        host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+        # Held for the whole device section, not just the lookup: the pool must
+        # not be admitted into between choosing the batch and launching against
+        # it. Uncontended in steady state - admission happens when a request
+        # arrives, not when a token is sampled.
+        with self.lock:
+            device = self._batch_for(len(rows))
+            device.set_grammars(
+                [grammar.grammar_id for grammar, _ in rows]
+                + [0] * (device.batch - len(rows))
+            )
+            # The matchers go straight to the packer rather than through a dict
+            # of Python configuration lists: at batch 512 that is 352 us
+            # against 1,373.
+            device.set_matchers([grammar.matcher for grammar, _ in rows])
+            host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
         # vLLM's bitmask spans the model's padded vocabulary and ours spans the
         # tokenizer's, so the rows differ in width. The tail is padding rather
         # than tokens, and a row is written wholesale, so it has to be cleared
@@ -287,14 +298,18 @@ class GpuGrammarBackend(StructuredOutputBackend):
         small: admitting a grammar can raise a ceiling, and buffers sized
         against the old one are too small for the new.
         """
-        stale = self.batch is not None and self.batch.pool_revision != self.pool.revision
-        if self.batch is None or self.batch.batch < size or stale:
-            self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
-            # Triton compiles on first use, and first use would otherwise be in
-            # the middle of a step.
-            self.batch.warmup()
-        self.batch.config_count.fill_(1)
-        return self.batch
+        with self.lock:
+            stale = (
+                self.batch is not None
+                and self.batch.pool_revision != self.pool.revision
+            )
+            if self.batch is None or self.batch.batch < size or stale:
+                self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
+                # Triton compiles on first use, and first use would otherwise
+                # be in the middle of a step.
+                self.batch.warmup()
+            self.batch.config_count.fill_(1)
+            return self.batch
 
     def _compile(self, request_type: StructuredOutputOptions, grammar_spec: str):
         if request_type == StructuredOutputOptions.JSON:
