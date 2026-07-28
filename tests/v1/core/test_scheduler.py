@@ -6222,3 +6222,63 @@ def test_plex_finish_action_aborts_the_request_before_the_running_loop():
     assert doomed not in output.num_scheduled_tokens
     # The plan is enacted too: an action does not cost the plan it came with.
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
+
+
+def test_plex_finish_action_leaves_the_client_an_abort_to_deliver():
+    """The policy's drop has to reach the caller, not just the scheduler.
+
+    `finish_requests` detaches the request inside the scheduler and returns the
+    (id, client index) pairs the engine core needs to notify. A client-issued
+    abort already knows its own outcome, but a policy drop is the engine's own
+    decision -- so discarding that list leaves the caller awaiting a stream
+    that will never produce another token. Measured before the fix: a live
+    PARD run hung indefinitely with the GPU idle, because `asyncio.gather` was
+    still waiting on the requests the policy had dropped.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    doomed = requests[0].request_id
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {"selections": [{"requests": [1], "token_budgets": [10]}]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [
+                {
+                    "id": 1,
+                    "method": "plex.request.finish@1",
+                    "args": {
+                        "request_id": doomed,
+                        "disposition": "cancelled",
+                        "idempotency_key": "abort-1",
+                    },
+                }
+            ],
+        },
+    )
+
+    scheduler.schedule()
+
+    aborted = scheduler.plex.take_aborted()
+    assert [req_id for req_id, _client in aborted] == [doomed], (
+        "the request the policy dropped has to be handed back for delivery, "
+        "or its caller waits forever"
+    )
+    assert scheduler.plex.take_aborted() == [], (
+        "delivery is once: a second drain must not re-report the same abort"
+    )

@@ -246,6 +246,7 @@ class VllmEnginePort:
         self._probed_tokens = 0
         self._hit_tokens = 0
         self._pending_finish: set[str] = set()
+        self._aborted: list[tuple[str, int]] = []
 
     def observe(self, request: Request) -> RequestSignals:
         """Record what only arrival order and the cache-at-arrival can say."""
@@ -392,7 +393,13 @@ class VllmEnginePort:
         return True
 
     def drain_actions(self) -> int:
-        """Apply staged finishes. Safe only outside the scheduler's loops."""
+        """Apply staged finishes. Safe only outside the scheduler's loops.
+
+        The aborted requests are retained rather than dropped: the client is
+        still awaiting output for a request the *engine* chose to end, so it
+        has to be told. `finish_requests` only detaches the request inside the
+        scheduler.
+        """
         if not self._pending_finish:
             return 0
         request_ids = sorted(self._pending_finish)
@@ -400,7 +407,14 @@ class VllmEnginePort:
         finished = self.scheduler.finish_requests(
             request_ids, RequestStatus.FINISHED_ABORTED
         )
+        self._aborted.extend(finished)
         return len(finished)
+
+    def take_aborted(self) -> list[tuple[str, int]]:
+        """Hand back the (request id, client index) pairs still unreported."""
+        aborted = self._aborted
+        self._aborted = []
+        return aborted
 
     def engine_facts(self) -> dict[str, Any]:
         scheduler = self.scheduler
@@ -531,6 +545,10 @@ class AsyncPlexPolicyController:
         # moment `finish_requests` can rebind `self.running` safely.
         self.port.drain_actions()
         return plan
+
+    def take_aborted(self) -> list[tuple[str, int]]:
+        """Requests the policy ended, whose clients have not been told yet."""
+        return self.port.take_aborted()
 
     def cached_preemption(self) -> CacheDecision | None:
         return self.controller.cached_reclaim()

@@ -585,6 +585,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        self._send_plex_aborts()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -643,6 +644,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            self._send_plex_aborts()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -729,6 +731,21 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _send_plex_aborts(self) -> None:
+        """Tell clients about requests a PLEX policy ended.
+
+        `finish_requests` only detaches a request inside the scheduler. When
+        the *client* asks for an abort it already knows, but a policy drop is
+        the engine's own decision, so without this the caller waits forever on
+        a stream that will never produce another token.
+        """
+        plex = self.scheduler.plex
+        if plex is None:
+            return
+        aborted = plex.take_aborted()
+        if aborted:
+            self._send_abort_outputs(aborted)
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
