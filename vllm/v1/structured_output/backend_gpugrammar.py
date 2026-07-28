@@ -52,8 +52,33 @@ class GpuGrammarGrammar(StructuredOutputGrammar):
     stop_token_ids: list[int]
     device: object = None
     grammar_id: int = 0
+    # Which admission of that slot this is. A slot freed by an eviction is
+    # reused, so the identifier alone would mask this request against whatever
+    # took the slot - a wrong mask that looks like a working one.
+    generation: int = 0
     _terminated: bool = field(default=False, repr=False)
     _processed: int = field(default=0, repr=False)
+    _pinned: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # A request holds its grammar in the pool for as long as it runs. The
+        # eviction policy only ever takes grammars nothing is running under, so
+        # this is what makes a budget safe rather than a source of wrong masks.
+        if self.device is not None:
+            self.device.pin(self.grammar_id)
+            self._pinned = True
+
+    def __del__(self) -> None:
+        # vLLM gives a backend no "request finished" hook, so the request's own
+        # lifetime is the signal: this object is per request and nothing else
+        # holds it. Unpinning late would only delay an eviction; unpinning
+        # early is what must not happen, and cannot here.
+        if self._pinned and self.device is not None:
+            try:
+                self.device.unpin(self.grammar_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._pinned = False
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         if self._terminated:
@@ -133,7 +158,15 @@ class GpuGrammarBackend(StructuredOutputBackend):
         # One arena for every schema the engine has seen, rather than one set of
         # tables per schema: a batch under many schemas is then one launch.
         self.pool: object = None
-        self.grammar_ids: dict[tuple, int] = {}
+        self.grammar_ids: dict[tuple, tuple[int, int]] = {}
+        # What the tables may occupy. They share the device with the model and
+        # the KV cache, so the pool needs a ceiling rather than whatever the
+        # allocator will still hand out. Past it a schema no request is running
+        # under is evicted, and re-admitted from the cached artifact if it comes
+        # back - a device copy, not a recompile.
+        self.table_budget_bytes = int(
+            os.environ.get("GPUGRAMMAR_TABLE_BUDGET_MB", "1024")
+        ) * (1 << 20)
         self.batch: object = None
         self.max_num_seqs = max(
             8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
@@ -170,16 +203,26 @@ class GpuGrammarBackend(StructuredOutputBackend):
             compiled = self._compile(request_type, grammar_spec)
         with self.lock:
             existing = self.compiled.get(key)
-            if existing is None:
-                self.compiled[key] = compiled
-                if self.device_parser is not None:
-                    if self.pool is None:
-                        self.pool = self.device_parser.DeviceGrammar()
-                    self.grammar_ids[key] = self.pool.admit(compiled)
-            else:
+            if existing is not None:
                 compiled = existing
+            self.compiled[key] = compiled
+            identifier, generation = 0, 0
+            if self.device_parser is not None:
+                if self.pool is None:
+                    self.pool = self.device_parser.DeviceGrammar(
+                        budget_bytes=self.table_budget_bytes
+                    )
+                held = self.grammar_ids.get(key)
+                # The cache outlives the pool's memory: a schema no request was
+                # using may have been evicted since, and the compiled artifact
+                # is still here to re-admit from. Re-admission is a device copy,
+                # not a recompile, which is why the artifact is worth keeping
+                # even when the tables are not.
+                if held is None or not self.pool.holds(*held):
+                    identifier = self.pool.admit(compiled)
+                    self.grammar_ids[key] = (identifier, self.pool.generation(identifier))
+                identifier, generation = self.grammar_ids[key]
             pool = self.pool
-            identifier = self.grammar_ids.get(key, 0)
         if pool is not None:
             # Compiling happens when a request is admitted, which is before any
             # step it takes part in - so this is where the kernels get built.
@@ -192,6 +235,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
             stop_token_ids=self.stop_token_ids,
             device=pool,
             grammar_id=identifier,
+            generation=generation,
         )
 
     def fill_bitmasks(
