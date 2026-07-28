@@ -18,6 +18,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -6282,3 +6283,202 @@ def test_plex_finish_action_leaves_the_client_an_abort_to_deliver():
     assert scheduler.plex.take_aborted() == [], (
         "delivery is once: a second drain must not re-report the same abort"
     )
+
+
+def test_plex_cache_residents_report_the_requests_that_share_their_blocks():
+    """A resident's beneficiary count has to be measured, not assumed 1.
+
+    Every prefix-reuse paper in the corpus -- Peek, Preble, HotPrefix,
+    RagCache, Marconi -- ranks a resident by the demand its bytes serve. The
+    binding used to report `beneficiary_count: 1` for all of them, so that
+    rank was a constant and the eviction order collapsed to the order the
+    controller happened to list residents in. Measured with the constant in
+    place, Peek scored 0.65 on prefix hit rate against vLLM's own recency
+    eviction -- it was not losing on merit, it had nothing to sort on.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=16)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(
+        num_requests=3, num_tokens=64, same_prompt=True, block_size=16
+    )
+
+    def step() -> None:
+        output = scheduler.schedule()
+        scheduled = list(output.num_scheduled_tokens)
+        if not scheduled:
+            return
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=scheduled,
+                req_id_to_index={
+                    request_id: index
+                    for index, request_id in enumerate(scheduled)
+                },
+                sampled_token_ids=[[1000] for _ in scheduled],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    # The first request must commit its prompt blocks before the others can
+    # be handed the same ones; sharing only exists once a block is cached.
+    scheduler.add_request(requests[0])
+    step()
+    for request in requests[1:]:
+        scheduler.add_request(request)
+    step()
+
+    sharing = scheduler.plex.port.beneficiaries(scheduler.plex.port.residents())
+    assert sharing, (
+        "three requests with an identical prompt share prefix blocks, so at "
+        "least one resident must name a peer -- an empty map means the "
+        "binding is blind to sharing and every policy ranking on demand is "
+        "ranking on a constant"
+    )
+    for request_id, peers in sharing.items():
+        assert request_id not in peers, "a request is not its own peer"
+        assert len(set(peers)) == len(peers), "peers must be deduplicated"
+
+
+def test_plex_cache_residents_count_pending_demand_as_a_beneficiary():
+    """Lookahead policies read the queue, so the queue has to be in the count.
+
+    Peek, Preble, HotPrefix and Marconi all keep a prefix because something
+    *not yet running* will reuse it. Counting only co-resident requests
+    reports a resident that nothing currently shares as demand zero, even
+    when the whole backlog is waiting on it -- so the policy evicts exactly
+    the block it was written to protect.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, block_size=16, max_num_seqs=1
+    )
+    attach_plex(scheduler, runtime)
+    requests = create_requests(
+        num_requests=2, num_tokens=64, same_prompt=True, block_size=16
+    )
+
+    scheduler.add_request(requests[0])
+    output = scheduler.schedule()
+    scheduled = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=scheduled,
+            req_id_to_index={
+                request_id: index for index, request_id in enumerate(scheduled)
+            },
+            sampled_token_ids=[[1000] for _ in scheduled],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    # The second request stays queued: one seat, and the first holds it.
+    scheduler.add_request(requests[1])
+
+    residents = scheduler.plex.port.residents()
+    assert [resident.engine_id for resident in residents] == [
+        requests[0].request_id
+    ], "only the first request should be resident"
+
+    sharing = scheduler.plex.port.beneficiaries(residents)
+    assert sharing.get(requests[0].request_id) == [requests[1].request_id], (
+        "the queued request would be served by the resident's blocks, so it "
+        "is a beneficiary of them -- reporting none makes the resident look "
+        "free to evict"
+    )
+
+
+def test_plex_holds_an_arrival_until_the_policy_admits_it(monkeypatch):
+    """An admission decision has to land before the work starts.
+
+    Five policies in the corpus -- FairServe, Qlm, SlosServe, Chameleon,
+    BranchRegulation -- turn on declining or deferring an arrival, and the
+    contract has carried an `admit` channel and a Pending state throughout.
+    Neither engine binding ever submitted one: the controller told the
+    policy the request had been admitted and started it in the same breath,
+    so the whole channel was unreachable on a real engine.
+    """
+    monkeypatch.setattr(envs, "PLEX_ADMISSION_CONTROL", True)
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.publish_plex()
+
+    assert scheduler.schedule().num_scheduled_tokens == {}, (
+        "a held request must not be scheduled: admission that happens after "
+        "the first token is not admission"
+    )
+    assert scheduler.has_requests(), (
+        "a held request keeps the engine awake -- an engine that quiesces "
+        "on it never runs the step that would release it"
+    )
+    submitted = [
+        (epoch, event)
+        for channel, epoch, event in runtime.submissions
+        if channel == "admit"
+    ]
+    assert submitted, "the policy must be asked before the engine decides"
+    epoch, event = submitted[-1]
+    candidates = event["context"]["candidates"]
+    assert len(candidates) == 2
+    assert all(
+        candidate["request"]["request_id"] for candidate in candidates
+    ), "every candidate names the request the policy is ruling on"
+
+    runtime.latest_results["admit"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "admit",
+                "plan": {"decisions": ["accept", "reject"]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    scheduler.publish_plex()
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {requests[0].request_id}, (
+        "the accepted request runs and the rejected one never does"
+    )
+    assert [request_id for request_id, _ in scheduler.plex.take_aborted()] == [
+        requests[1].request_id
+    ], "a rejected caller has to be told, not left waiting on a dead stream"
+
+
+def test_plex_admits_natively_when_the_policy_never_answers(monkeypatch):
+    """Silence is not a veto.
+
+    A policy that never rules -- crashed, too slow, or simply without an
+    `admit` of its own -- must not strand every caller. The engine keeps its
+    own behaviour, which is to admit, exactly as an expired schedule plan
+    falls back to native scheduling.
+    """
+    monkeypatch.setattr(envs, "PLEX_ADMISSION_CONTROL", True)
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.publish_plex()
+
+    assert scheduler.schedule().num_scheduled_tokens == {}, "held at first"
+
+    monkeypatch.setattr(
+        scheduler.plex.controller, "ADMISSION_DEADLINE_S", 0.0
+    )
+    scheduler.publish_plex()
+
+    assert set(scheduler.schedule().num_scheduled_tokens) == {
+        request.request_id
+    }, "past the deadline the engine admits on its own terms"

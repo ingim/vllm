@@ -353,6 +353,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills: set[Request] = set()
 
         self.plex: AsyncPlexPolicyController | None = None
+        self._plex_held: dict[str, Request] = {}
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
                 self.scheduler_config.plex_policy,
@@ -474,6 +475,7 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+        self._release_plex_admissions()
         plex_plan = self.plex.poll_schedule() if self.plex is not None else None
         if plex_plan is not None:
             self.running.sort(
@@ -2255,6 +2257,38 @@ class Scheduler(SchedulerInterface):
             self._activate_request(request)
             if self.plex is not None:
                 self.plex.register_request(request)
+                if self.plex.awaiting_admission():
+                    # The policy has not ruled yet. Hold the request out of
+                    # every scheduling queue: an admission control that runs
+                    # after the work has started is not admission control.
+                    self._hold_for_admission(request)
+
+    def _hold_for_admission(self, request: Request) -> None:
+        if self.plex is None or not self.plex.holds(request.request_id):
+            return
+        self.waiting.remove_request(request)
+        self._plex_held[request.request_id] = request
+
+    def _release_plex_admissions(self) -> None:
+        """Move settled arrivals into the queue, or drop the ones refused."""
+        if self.plex is None or not self._plex_held:
+            return
+        rejected: list[str] = []
+        for engine_id, accepted in self.plex.take_admissions().items():
+            request = self._plex_held.pop(engine_id, None)
+            if request is None:
+                continue
+            if accepted:
+                self._enqueue_waiting_request(request)
+            else:
+                # Put it back where finish_requests expects to find it, so
+                # the one code path that notifies the caller still runs.
+                self._enqueue_waiting_request(request)
+                rejected.append(engine_id)
+        if rejected:
+            self.plex.note_finished(
+                self.finish_requests(rejected, RequestStatus.FINISHED_ABORTED)
+            )
 
     def _activate_request(self, request: Request) -> None:
         if request.resumable and request.streaming_queue is None:
@@ -2428,7 +2462,10 @@ class Scheduler(SchedulerInterface):
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
         )
-        return num_waiting + len(self.running)
+        # A request held for admission is in no queue, but it is the engine's
+        # to answer for: quiescing on it would leave the caller waiting on a
+        # verdict that only a running engine can deliver.
+        return num_waiting + len(self.running) + len(self._plex_held)
 
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
@@ -2438,7 +2475,10 @@ class Scheduler(SchedulerInterface):
         # Finished requests waiting on delayed connector cleanup remain in
         # self.requests after they have been removed from scheduling queues.
         num_in_queues = (
-            len(self.waiting) + len(self.skipped_waiting) + len(self.running)
+            len(self.waiting)
+            + len(self.skipped_waiting)
+            + len(self.running)
+            + len(self._plex_held)
         )
         return len(self.requests) > num_in_queues
 

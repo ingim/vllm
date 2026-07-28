@@ -10,11 +10,13 @@ queues and what its per-request counters are called.
 
 from __future__ import annotations
 
+import itertools
 import time
 from typing import TYPE_CHECKING, Any
 
 from plex.engine import (
     NO_SIGNALS,
+    AdmissionCapacity,
     CacheCapacity,
     CacheDecision,
     PolicyController,
@@ -23,10 +25,12 @@ from plex.engine import (
     SchedulePlan,
 )
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.request import Request
 
@@ -212,6 +216,85 @@ def under_pressure(scheduler: Scheduler) -> bool:
     )
 
 
+#: How deep into the queue a lookahead policy may read. The same bound the
+#: contract puts on any other working set, so a deep backlog costs a bounded
+#: scan rather than the engine's step time.
+MAX_LOOKAHEAD_REQUESTS = 256
+
+
+def shared_beneficiaries(
+    scheduler: Scheduler, request_ids: list[str]
+) -> dict[str, list[str]]:
+    """For each resident, every request whose work its blocks serve.
+
+    A prefix-caching engine hands the same block to every request whose
+    prompt shares that prefix, so a resident's real beneficiary set is the
+    requests sitting on its blocks -- not, as the contract's default
+    assumes, the one request that happens to own the entry. Without this
+    every resident reports a beneficiary count of exactly 1, and a policy
+    that ranks residents by demand ranks them all equal: it evicts in list
+    order, which is arbitrary, where vLLM would have evicted by recency.
+
+    The set has two halves, and a policy needs both:
+
+      running   requests already holding the same block. Evicting one of
+                these frees the least, because the block stays referenced.
+      waiting   requests whose prompt would hit the block if it survives.
+                This is the half the lookahead papers are named for -- Peek
+                keeps what pending demand will reuse -- and it is invisible
+                from the running set alone. Measured with only the running
+                half, Peek scored 0.69 on prefix hit rate; the demand it is
+                supposed to read was all in the queue.
+    """
+    holders: dict[int, list[str]] = {}
+    for request_id in request_ids:
+        try:
+            groups = scheduler.kv_cache_manager.get_blocks(request_id).blocks
+        except (KeyError, AttributeError):
+            continue
+        for group_blocks in groups:
+            for block in group_blocks:
+                holders.setdefault(block.block_id, []).append(request_id)
+
+    sharing: dict[str, set[str]] = {request_id: set() for request_id in request_ids}
+    for block_holders in holders.values():
+        if len(block_holders) < 2:
+            continue
+        for request_id in block_holders:
+            sharing[request_id].update(block_holders)
+            sharing[request_id].discard(request_id)
+
+    # The queue carries the same bound as any other working set, so a deep
+    # backlog costs a bounded scan rather than the engine's step time.
+    for waiting in itertools.islice(scheduler.waiting, MAX_LOOKAHEAD_REQUESTS):
+        for block in _cache_hit_blocks(scheduler, waiting):
+            for request_id in holders.get(block.block_id, ()):
+                if request_id != waiting.request_id:
+                    sharing[request_id].add(waiting.request_id)
+
+    return {
+        request_id: sorted(peers)
+        for request_id, peers in sharing.items()
+        if peers
+    }
+
+
+def _cache_hit_blocks(scheduler: Scheduler, request: Request) -> list[KVCacheBlock]:
+    """Blocks a not-yet-running request would be handed by the prefix cache.
+
+    Read-only: the lookup walks the block-hash table and takes no
+    references, so asking on behalf of a queued request cannot change what
+    the engine would then do.
+    """
+    manager = scheduler.kv_cache_manager
+    if not manager.prefix_cache_lookup_enabled(request):
+        return []
+    groups, _, _ = manager.coordinator.find_longest_cache_hit(
+        request.block_hashes, max(request.num_tokens - 1, 0)
+    )
+    return [block for group_blocks in groups for block in group_blocks]
+
+
 def prefix_hit_tokens(scheduler: Scheduler, request: Request) -> int:
     """Prompt tokens already in the prefix cache, read without disturbing it.
 
@@ -324,6 +407,35 @@ class VllmEnginePort:
     def under_pressure(self) -> bool:
         return under_pressure(self.scheduler)
 
+    #: vLLM starts a request only when `schedule` picks it out of `waiting`,
+    #: so a request can be held between arrival and the first schedule with
+    #: no engine state to unwind. That window is what makes real admission
+    #: control expressible here.
+    #:
+    #: Opt-in, because holding is only correct when the policy answers: a
+    #: policy with no `admit` of its own returns `fallback-required`, and
+    #: every arrival would then pay the deadline before starting. The
+    #: deployment says which it is.
+    @property
+    def admission_controlled(self) -> bool:
+        return envs.PLEX_ADMISSION_CONTROL
+
+    def admission_capacity(self) -> AdmissionCapacity:
+        scheduler = self.scheduler
+        return AdmissionCapacity(
+            max_accepted=max(
+                scheduler.max_num_running_reqs - len(scheduler.running), 0
+            ),
+            max_tokens=scheduler.max_num_scheduled_tokens,
+        )
+
+    def beneficiaries(
+        self, residents: list[VllmRequest]
+    ) -> dict[str, list[str]]:
+        return shared_beneficiaries(
+            self.scheduler, [resident.engine_id for resident in residents]
+        )
+
     # --- mechanics -----------------------------------------------------------
     #
     # Only what vLLM really performs. Notably absent:
@@ -415,6 +527,10 @@ class VllmEnginePort:
         aborted = self._aborted
         self._aborted = []
         return aborted
+
+    def note_aborted(self, finished: list[tuple[str, int]]) -> None:
+        """Queue an abort the scheduler performed on the policy's behalf."""
+        self._aborted.extend(finished)
 
     def engine_facts(self) -> dict[str, Any]:
         scheduler = self.scheduler
@@ -549,6 +665,19 @@ class AsyncPlexPolicyController:
     def take_aborted(self) -> list[tuple[str, int]]:
         """Requests the policy ended, whose clients have not been told yet."""
         return self.port.take_aborted()
+
+    def awaiting_admission(self) -> bool:
+        return self.controller.awaiting_admission()
+
+    def holds(self, engine_id: str) -> bool:
+        return self.controller.holds(engine_id)
+
+    def take_admissions(self) -> dict[str, bool]:
+        return self.controller.take_admissions()
+
+    def note_finished(self, finished: list[tuple[str, int]]) -> None:
+        """Route a rejection's abort through the same delivery as any other."""
+        self.port.note_aborted(finished)
 
     def cached_preemption(self) -> CacheDecision | None:
         return self.controller.cached_reclaim()

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     VLLM_USAGE_SOURCE: str = "production"
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
+    PLEX_ADMISSION_CONTROL: bool = False
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -816,6 +817,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOGGING_CONFIG_PATH": lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
     # this is used for configuring the default logging level
     "VLLM_LOGGING_LEVEL": lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO").upper(),
+    # Hold each arrival until the PLEX policy has ruled on it. Only
+    # meaningful for a policy that implements `admit`; anything else pays
+    # the admission deadline on every request and admits it anyway.
+    "PLEX_ADMISSION_CONTROL": lambda: bool(int(os.getenv("PLEX_ADMISSION_CONTROL", "0"))),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
