@@ -253,6 +253,61 @@ def test_plex_async_plan_is_consumed_without_invoking_policy_in_schedule():
     assert len(runtime.submissions) == submitted
 
 
+def test_plex_a_request_the_plan_never_saw_is_scheduled_on_the_engine_budget():
+    """A plan outlives arrivals, and the ones it missed still have to run.
+
+    The plan is decided on a snapshot and answered a step later, so a request
+    that arrived in between carries no decision at all -- not a rejection.
+    Reading the absence as "declined" starved every late arrival; but once the
+    engine started admitting them, every question it asks the plan about such
+    a request has to have an answer. Asking for a token budget raised KeyError
+    and killed a live EngineCore, which is why both halves are pinned here.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    scheduler.add_request(requests[0])
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {"selections": [{"requests": [0], "token_budgets": [4]}]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    # Arrives after the plan was submitted, so the policy never ruled on it.
+    scheduler.add_request(requests[1])
+
+    plan = scheduler.plex.poll_schedule()
+    assert plan is not None
+    assert plan.saw(requests[0].request_id)
+    assert not plan.saw(requests[1].request_id)
+    assert plan.token_budget(requests[1].request_id) is None
+
+    output = scheduler.schedule()
+
+    scheduled = output.num_scheduled_tokens
+    assert requests[1].request_id in scheduled, (
+        "a request the policy never saw must not be starved by its absence"
+    )
+    assert scheduled[requests[0].request_id] == 4, "the plan's budget still binds"
+    assert scheduled[requests[1].request_id] == 10, (
+        "an unruled request runs on the engine's own budget, not the plan's"
+    )
+
+
 def test_plex_async_rejects_non_atomic_multi_request_selection():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()

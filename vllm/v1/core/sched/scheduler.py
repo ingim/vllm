@@ -542,9 +542,9 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
             if plex_plan is not None:
-                num_new_tokens = min(
-                    num_new_tokens, plex_plan.token_budget(request.request_id)
-                )
+                plex_budget = plex_plan.token_budget(request.request_id)
+                if plex_budget is not None:
+                    num_new_tokens = min(num_new_tokens, plex_budget)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -934,9 +934,9 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     if plex_plan is not None:
-                        num_new_tokens = min(
-                            num_new_tokens, plex_plan.token_budget(request_id)
-                        )
+                        plex_budget = plex_plan.token_budget(request_id)
+                        if plex_budget is not None:
+                            num_new_tokens = min(num_new_tokens, plex_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
