@@ -381,6 +381,9 @@ class VllmEnginePort:
         # to choose between, and nothing else in vLLM holds a handle to them
         # once `finish_requests` is done.
         self._parked: dict[str, Request] = {}
+        # Evictions charged at the previous `cache_capacity`; the difference is
+        # what the engine consumed while the last plan was in force.
+        self._plex_last_evicted = 0
 
     def observe(self, request: Request) -> RequestSignals:
         """Record what only arrival order and the cache-at-arrival can say."""
@@ -435,6 +438,17 @@ class VllmEnginePort:
             seen.add(request.request_id)
             candidates.append(self.view(request))
         return candidates
+
+    def cached_resident_ids(self) -> frozenset[str]:
+        """Requests the block pool still holds cached KV for.
+
+        The controller uses this to keep a finished request resolvable while
+        its bytes are still resident. Without it the host refuses to resolve
+        the id and every parked resident is dropped from the cache submission
+        -- which is to say the policy never sees the objects it exists to rank.
+        """
+        pool = self.scheduler.kv_cache_manager.block_pool
+        return frozenset(pool.plex_cached_owners())
 
     def engine_stats(self) -> dict[str, int]:
         """Who decided each cached block's eviction, policy or LRU.
@@ -518,16 +532,28 @@ class VllmEnginePort:
         Demanding more than can be freed makes every plan over budget, and the
         contract refuses an over-budget plan *whole* -- which is the S6.24
         defect class, and it would turn a starved channel into a dead one.
+
+        The deficit alone is a *level*, and the engine consumes at a *rate*:
+        it evicts roughly 90 blocks/s while the channel is invoked ~2.5 times/s,
+        so a plan sized to the instantaneous shortfall is spent within
+        milliseconds and LRU decides the rest of the interval. The demand
+        therefore also carries what the engine actually took since the last
+        ask -- measured, not tuned, and self-correcting: if the ranking covers
+        the interval the LRU share falls and the observed rate stays put.
         """
         unit = reclaim_unit(self.scheduler)
         pool = self.scheduler.kv_cache_manager.block_pool
         census = pool.plex_cached_owners()
         cached_blocks = sum(census.values())
         deficit = max(pool.num_gpu_blocks // 2 - pool.get_num_free_blocks(), 0)
+        stats = pool.plex_eviction_stats()
+        evicted = stats["prefix_evicted_by_policy"] + stats["prefix_evicted_by_lru"]
+        taken = max(evicted - self._plex_last_evicted, 0)
+        self._plex_last_evicted = evicted
         wanted = 1
-        if deficit and cached_blocks and census:
+        if cached_blocks and census:
             mean = max(cached_blocks // len(census), 1)
-            wanted = -(-deficit // mean)
+            wanted = -(-(deficit + taken) // mean)
         wanted = max(1, min(wanted, len(census) or 1, max(len(residents), 1)))
         return CacheCapacity(
             max_bytes=max(unit * len(residents) - unit * wanted, 0),
