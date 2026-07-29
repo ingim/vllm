@@ -183,7 +183,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
         # rare and it is a wrong mask, which is the worst combination.
         self.lock = threading.RLock()
         try:
-            from gpu_lr1 import device_parser
+            from gpugrammar import _engine as device_parser
 
             self.device_parser = device_parser
         except Exception:  # noqa: BLE001
@@ -343,9 +343,11 @@ class GpuGrammarBackend(StructuredOutputBackend):
         against the old one are too small for the new.
         """
         with self.lock:
-            stale = (
-                self.batch is not None
-                and self.batch.pool_revision != self.pool.revision
+            stale = self.batch is not None and (
+                self.batch.pool_revision != self.pool.revision
+                # A grammar can raise a ceiling without moving an array, and
+                # buffers sized against the old one are too small for the new.
+                or self.batch.outgrown
             )
             if self.batch is None or self.batch.batch < size or stale:
                 self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
