@@ -657,6 +657,39 @@ def test_plex_reports_prefix_cache_hit_before_the_request_is_scheduled():
     assert facts["uncached_tokens"] == 64 - facts["lpm_hit_tokens"]
     assert facts["prefix_hit_ratio_ppm"] > 0
     assert scheduler.plex.port.engine_facts()["hit_ratio_ppm"] > 0
+    # "Some of this request's KV is already resident" is true of exactly this
+    # request: it is still waiting, so nothing has been computed for it, but
+    # its prefix is in the cache. Testing `num_computed_tokens > 0` alone
+    # answered `false` for every request in the queue however warm it was --
+    # which is the one a cache-aware scheduler most wants to prefer.
+    assert facts["cache_ready"] is True
+
+
+def test_plex_cache_state_kind_names_the_objects_residency_not_the_request():
+    """The cache layer's subject is the KV, so its state vocabulary is the KV's.
+
+    Publishing `request.status.name.lower()` here put vLLM's request lifecycle
+    ("waiting", "running") under the same fact name SGLang answers with the
+    object's residency ("resident", "retracted"), so a policy branching on it
+    read two different vocabularies through one name. Found by replaying one
+    situation through both bindings.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    scheduler.add_request(request)
+
+    waiting = scheduler.plex.port.view(request).cache_facts()["state_kind"]
+    assert waiting == "resident", waiting
+
+    scheduler.schedule()
+    running = scheduler.plex.port.view(request).cache_facts()["state_kind"]
+    assert running == "resident", running
+
+    request.status = RequestStatus.PREEMPTED
+    preempted = scheduler.plex.port.view(request).cache_facts()["state_kind"]
+    assert preempted == "retracted", preempted
 
 
 def test_plex_async_missing_plan_uses_native_scheduler():

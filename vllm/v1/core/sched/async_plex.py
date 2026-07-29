@@ -108,7 +108,17 @@ class VllmRequest:
             "call_wait_us": waiting_ms * 1000,
             "arrival_ms": int(request.arrival_time * 1000),
             "arrival_seq": signals.arrival_seq,
-            "cache_ready": request.num_computed_tokens > 0,
+            # "Some of this request's KV is already resident" -- which is true
+            # of a running request's own computed prefix *and* of a waiting
+            # request whose prompt matched the prefix cache. Testing only the
+            # first answered `false` for every request still in the queue, no
+            # matter how much of it was already cached, which is precisely the
+            # request a cache-aware scheduler wants to prefer. Found by
+            # replaying one situation through both bindings: SGLang tested only
+            # the second and was wrong the other way round, on the running case.
+            "cache_ready": (
+                request.num_computed_tokens > 0 or hit > 0
+            ),
             "cached_tokens": request.num_computed_tokens,
             "prompt_tokens": prompt_tokens,
             "computation_length": prompt_tokens + len(request.output_token_ids),
@@ -137,7 +147,18 @@ class VllmRequest:
                 request.num_prompt_tokens + len(request.output_token_ids)
             ),
             "last_access_ms": self._signals.last_access_ms,
-            "state_kind": request.status.name.lower(),
+            # The state of the cached *object*, not of the request that owns
+            # it. Publishing `request.status.name.lower()` here put vLLM's
+            # request lifecycle ("waiting", "running") under a name SGLang
+            # answers with the object's residency ("resident", "retracted"),
+            # so a policy branching on it read two different vocabularies
+            # through one fact. `preempted` on the request layer already
+            # carries the lifecycle; this layer answers about the KV.
+            "state_kind": (
+                "retracted"
+                if request.status == RequestStatus.PREEMPTED
+                else "resident"
+            ),
             "tier": "gpu",
         }
 
