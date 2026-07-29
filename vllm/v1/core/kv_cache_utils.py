@@ -303,6 +303,37 @@ class FreeKVCacheBlockQueue:
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
+    def num_leading_uncached(self, limit: int) -> int:
+        """How many blocks at the head cache nothing, up to `limit`.
+
+        Freeing prepends hashless blocks and appends hashed ones, so anything
+        cached-but-free sits behind everything that is free and empty. Taking
+        the empty ones first costs no cache entry at all, which is why a
+        ranking over cache residents must never be applied until they run out:
+        otherwise the policy's first choice is evicted while an unused block
+        sits at the head of the queue.
+        """
+        count = 0
+        block = self.fake_free_list_head.next_free_block
+        while (
+            count < limit
+            and block is not None
+            and block is not self.fake_free_list_tail
+            and block.block_hash is None
+        ):
+            count += 1
+            block = block.next_free_block
+        return count
+
+    def contains(self, block: KVCacheBlock) -> bool:
+        """Whether `block` is currently linked into the free list.
+
+        `remove` raises on a block that is not, and a caller holding its own
+        index of free blocks -- as the PLEX eviction order does -- can race
+        that index against an allocation. Asking is cheaper than recovering.
+        """
+        return block.prev_free_block is not None and block.next_free_block is not None
+
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 

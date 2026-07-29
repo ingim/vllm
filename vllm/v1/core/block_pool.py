@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -194,6 +194,37 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # PLEX owns the eviction order when a policy is attached.
+        #
+        # Without this, `get_new_blocks` pops the head of `free_block_queue`,
+        # which is vLLM's own LRU, and destroys whatever those blocks cached.
+        # A policy asked to rank cache residents was therefore ranking
+        # something the engine never consulted: the cache channel reached the
+        # scheduler only as a *preemption* victim choice, on the rare path
+        # where `allocate_slots` returns None. Every prefix eviction -- the
+        # decision `prefix_hit_rate` actually measures -- was vLLM's LRU. Five
+        # replications measured ~1.00 against native for that reason, and a
+        # deliberately adversarial policy moved the metric 3.5%.
+        #
+        # `_plex_cached_owner` remembers which request last cached each block,
+        # recorded when the blocks are freed while still holding a hash, and
+        # `_plex_eviction_order` is the policy's ranking over those owners.
+        # LRU stays as the tail-breaker for blocks the policy did not rank.
+        self._plex_cached_owner: dict[int, str] = {}
+        #: Reverse index of the same mapping. Kept incrementally because
+        #: `_plex_take` runs per allocation and rebuilding owner -> blocks from
+        #: scratch there would cost O(cached blocks) on the hot path.
+        self._plex_owner_blocks: dict[str, set[int]] = {}
+        self._plex_eviction_order: Callable[[], Sequence[str]] | None = None
+        #: Blocks taken because the policy ranked their owner, and blocks taken
+        #: off the LRU tail after the ranking ran out. Without these the new
+        #: path is unobservable: `cache_enacted` counts only preemptions, so a
+        #: ranking that never reached a single eviction would look exactly like
+        #: one that decided every eviction. That is the defect this wiring
+        #: exists to remove, and it applies to the fix as much as to the bug.
+        self._plex_evicted_ranked = 0
+        self._plex_evicted_lru = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,7 +689,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = self._plex_take(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -676,6 +707,114 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
+    def set_plex_eviction_order(
+        self, order: Callable[[], Sequence[str]] | None
+    ) -> None:
+        """Hand the prefix-eviction order to a PLEX policy.
+
+        `order` returns request ids worst-first: whatever the policy most wants
+        gone is evicted first. It is consulted per allocation, so a policy that
+        has not answered yet, or that ranks nothing, costs one empty call and
+        leaves vLLM's LRU in charge.
+        """
+        self._plex_eviction_order = order
+
+    def _plex_take(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Take `num_blocks` free blocks, worst-ranked first.
+
+        Blocks belonging to owners the policy ranked come out in that order;
+        anything left over comes off the head of the free queue exactly as
+        before. Ranked blocks are pulled with `remove`, which is O(1) on the
+        doubly linked list, so the ordering costs no more than the LRU path.
+
+        Two invariants have to hold or vLLM corrupts: every returned block must
+        have `ref_cnt == 0` (guaranteed -- only free blocks are in the queue and
+        in `_plex_cached_owner`), and each must be returned exactly once (hence
+        `taken`, since one owner's blocks can be listed under several ranks
+        after a prefix is shared).
+        """
+        if self._plex_eviction_order is None or num_blocks == 0:
+            return self.free_block_queue.popleft_n(num_blocks)
+        ranked = self._plex_eviction_order()
+        if not ranked:
+            return self.free_block_queue.popleft_n(num_blocks)
+        # Blocks that cache nothing are free in both senses. Spending the
+        # policy's ranking while one of those sits at the head would evict a
+        # prefix to avoid using an empty page.
+        free_first = self.free_block_queue.num_leading_uncached(num_blocks)
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(free_first)
+        if len(ret) >= num_blocks:
+            return ret
+        taken: set[int] = set()
+        for owner in ranked:
+            if len(ret) >= num_blocks:
+                break
+            for block_id in tuple(self._plex_owner_blocks.get(owner, ())):
+                block = self.blocks[block_id]
+                if len(ret) >= num_blocks:
+                    break
+                # A block whose owner freed it and something else then cached
+                # is no longer this owner's to give away.
+                if block.ref_cnt != 0 or block.block_id in taken:
+                    continue
+                if not self.free_block_queue.contains(block):
+                    continue
+                self.free_block_queue.remove(block)
+                self._plex_drop(block.block_id)
+                taken.add(block.block_id)
+                ret.append(block)
+        self._plex_evicted_ranked += len(ret) - free_first
+        if len(ret) < num_blocks:
+            tail = self.free_block_queue.popleft_n(num_blocks - len(ret))
+            # Only a block that cached something was an eviction the policy
+            # could have owned and did not. An empty page is nobody's loss.
+            self._plex_evicted_lru += sum(
+                1 for block in tail if block.block_hash is not None
+            )
+            ret.extend(tail)
+        return ret
+
+    def plex_eviction_stats(self) -> dict[str, int]:
+        """Who actually decided each cached block's eviction."""
+        return {
+            "prefix_evicted_by_policy": self._plex_evicted_ranked,
+            "prefix_evicted_by_lru": self._plex_evicted_lru,
+        }
+
+    def _plex_own(self, block_id: int, owner: str) -> None:
+        previous = self._plex_cached_owner.get(block_id)
+        if previous == owner:
+            return
+        if previous is not None:
+            self._plex_drop(block_id)
+        self._plex_cached_owner[block_id] = owner
+        self._plex_owner_blocks.setdefault(owner, set()).add(block_id)
+
+    def _plex_drop(self, block_id: int) -> None:
+        owner = self._plex_cached_owner.pop(block_id, None)
+        if owner is None:
+            return
+        blocks = self._plex_owner_blocks.get(owner)
+        if blocks is None:
+            return
+        blocks.discard(block_id)
+        if not blocks:
+            del self._plex_owner_blocks[owner]
+
+    def plex_cached_owners(self) -> dict[str, int]:
+        """Free-but-cached blocks per owning request.
+
+        This is the resident set a prefix-cache policy is actually choosing
+        between: a block still holding a hash, referenced by nobody, that a
+        later request would hit if it survives. Requests that are still running
+        do not appear -- their blocks are referenced, so no eviction decision
+        exists for them.
+        """
+        return {
+            owner: len(blocks)
+            for owner, blocks in self._plex_owner_blocks.items()
+        }
+
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -690,6 +829,10 @@ class BlockPool:
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
+        # Whatever this block cached is gone, so it is no longer a resident any
+        # policy can rank. Dropping it here covers eviction by the LRU tail of
+        # `_plex_take` as well as by the policy's own ranking.
+        self._plex_drop(block.block_id)
 
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
@@ -712,17 +855,30 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                # A block that has been hit is live again and no longer a
+                # cache resident anyone can rank; leaving it mapped would let
+                # the policy nominate a block it cannot have and silently fall
+                # through to LRU for that allocation.
+                self._plex_drop(block.block_id)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], owner: str | None = None
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            owner: the request whose KV these blocks hold. A freed block that
+                still carries a hash stays in the prefix cache and is what a
+                later request hits, so this is the identity a cache policy
+                ranks. It is recorded only while a PLEX policy is attached;
+                `None` leaves the map untouched and vLLM behaves exactly as
+                upstream.
         """
         # Identify blocks with hash (LRU cache) and without it (will never match in APC)
         blocks_with_hash = []
@@ -734,6 +890,9 @@ class BlockPool:
                     blocks_without_hash.append(block)
                 else:
                     blocks_with_hash.append(block)
+        if owner is not None and self._plex_eviction_order is not None:
+            for block in blocks_with_hash:
+                self._plex_own(block.block_id, owner)
 
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)

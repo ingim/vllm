@@ -4309,3 +4309,95 @@ def test_swa_shared_prefix_reuse_under_zero_retention(monkeypatch):
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def _plex_pool(num_blocks: int) -> BlockPool:
+    return BlockPool(
+        num_gpu_blocks=num_blocks, enable_caching=True, hash_block_size=16
+    )
+
+
+def _plex_seed(pool: BlockPool, owner: str, count: int):
+    """Allocate `count` blocks for `owner` and put them in the prefix cache."""
+    blocks = pool.get_new_blocks(count)
+    for index, block in enumerate(blocks):
+        block_hash = hash((owner, index))
+        block.set_block_hash(block_hash, num_tokens=16)
+        pool.cached_block_hash_to_block.insert(block_hash, block)
+        pool.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
+            block_hash
+        )
+    return sorted(block.block_id for block in blocks)
+
+
+def test_plex_eviction_order_is_inert_without_a_policy():
+    """No policy attached must reproduce upstream LRU exactly.
+
+    The owner map is the only state PLEX adds, and it stays empty unless a
+    policy asked for the order. Anything else would make the integration
+    change behaviour on a deployment that never enabled it.
+    """
+    pool = _plex_pool(5)
+    first = _plex_seed(pool, "A", 2)
+    second = _plex_seed(pool, "B", 2)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1])
+    pool.free_blocks(pool.blocks[second[0] : second[-1] + 1])
+
+    assert pool.plex_cached_owners() == {}
+    assert sorted(b.block_id for b in pool.get_new_blocks(2)) == first
+
+
+def test_plex_policy_chooses_the_eviction_victim():
+    """The policy's ranking must beat LRU, which is the whole point.
+
+    `A` is at the head of the free queue, so vLLM would evict it. A policy
+    that ranks `B` worst-to-keep must get `B` evicted instead -- otherwise the
+    cache channel is decorative and every prefix-caching replication is
+    measuring vLLM's recency heuristic under its own name.
+    """
+    pool = _plex_pool(5)
+    order: list[str] = []
+    pool.set_plex_eviction_order(lambda: list(order))
+    first = _plex_seed(pool, "A", 2)
+    second = _plex_seed(pool, "B", 2)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+    pool.free_blocks(pool.blocks[second[0] : second[-1] + 1], owner="B")
+
+    assert pool.plex_cached_owners() == {"A": 2, "B": 2}
+    order[:] = ["B"]
+    assert sorted(b.block_id for b in pool.get_new_blocks(2)) == second
+    # Only the evicted owner leaves the resident set.
+    assert pool.plex_cached_owners() == {"A": 2}
+
+
+def test_plex_spends_free_blocks_before_the_ranking():
+    """An empty page costs nothing; a cached one costs a prefix.
+
+    Freeing prepends hashless blocks and appends hashed ones, so a ranking
+    applied at the head of the queue would evict the policy's first choice
+    while an unused block sat in front of it.
+    """
+    pool = _plex_pool(9)
+    order: list[str] = []
+    pool.set_plex_eviction_order(lambda: list(order))
+    first = _plex_seed(pool, "A", 2)
+    second = _plex_seed(pool, "B", 2)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+    pool.free_blocks(pool.blocks[second[0] : second[-1] + 1], owner="B")
+
+    order[:] = ["B"]
+    taken = sorted(b.block_id for b in pool.get_new_blocks(2))
+    assert not set(taken) & set(first + second)
+    assert pool.plex_cached_owners() == {"A": 2, "B": 2}
+
+
+def test_plex_hit_removes_a_block_from_the_resident_set():
+    """A block a request hit is live again, so nobody may rank it."""
+    pool = _plex_pool(5)
+    pool.set_plex_eviction_order(list)
+    first = _plex_seed(pool, "A", 2)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+
+    assert pool.plex_cached_owners() == {"A": 2}
+    pool.touch([pool.blocks[first[0]]])
+    assert pool.plex_cached_owners() == {"A": 1}

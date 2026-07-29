@@ -55,17 +55,19 @@ PlexCacheDecision = CacheDecision
 class VllmRequest:
     """One `Request`, answering the questions `plex.engine` asks."""
 
-    __slots__ = ("_request", "_scheduler", "_signals")
+    __slots__ = ("_request", "_scheduler", "_signals", "_cached_blocks")
 
     def __init__(
         self,
         request: Request,
         scheduler: Scheduler,
         signals: RequestSignals | None = None,
+        cached_blocks: int | None = None,
     ) -> None:
         self._request = request
         self._scheduler = scheduler
         self._signals = signals if signals is not None else NO_SIGNALS
+        self._cached_blocks = cached_blocks
 
     @property
     def engine_id(self) -> str:
@@ -156,7 +158,8 @@ class VllmRequest:
             # carries the lifecycle; this layer answers about the KV.
             "state_kind": (
                 "retracted"
-                if request.status == RequestStatus.PREEMPTED
+                if self._cached_blocks is not None
+                or request.status == RequestStatus.PREEMPTED
                 else "resident"
             ),
             "tier": "gpu",
@@ -194,6 +197,11 @@ class VllmRequest:
 
     def actual_size_bytes(self) -> int:
         scheduler = self._scheduler
+        if self._cached_blocks is not None:
+            # A parked resident holds no allocation the KV manager still knows
+            # about -- its blocks were freed and stayed in the prefix cache.
+            # Its size is what those blocks occupy.
+            return self._cached_blocks * page_size_bytes(scheduler)
         blocks = scheduler.kv_cache_manager.get_blocks(
             self._request.request_id
         ).blocks
@@ -206,6 +214,23 @@ class VllmRequest:
 
     def reload_cost(self) -> int:
         return self._request.num_computed_tokens
+
+
+def page_size_bytes(scheduler: Scheduler) -> int:
+    """Bytes held by one block of the largest KV cache group.
+
+    `_plex_cached_owner` counts individual blocks without recording which
+    group each came from, so a multi-group config over-reports a parked
+    resident's size. Over-reporting is the safe direction: a policy asked to
+    free a byte budget frees at least it.
+    """
+    return max(
+        (
+            group.kv_cache_spec.page_size_bytes
+            for group in scheduler.kv_cache_config.kv_cache_groups
+        ),
+        default=1,
+    )
 
 
 def reclaim_unit(scheduler: Scheduler) -> int:
@@ -351,6 +376,11 @@ class VllmEnginePort:
         self._hit_tokens = 0
         self._pending_finish: set[str] = set()
         self._aborted: list[tuple[str, int]] = []
+        # Requests that have left the scheduler but whose KV is still in the
+        # prefix cache. They are the only reason a prefix eviction has anything
+        # to choose between, and nothing else in vLLM holds a handle to them
+        # once `finish_requests` is done.
+        self._parked: dict[str, Request] = {}
 
     def observe(self, request: Request) -> RequestSignals:
         """Record what only arrival order and the cache-at-arrival can say."""
@@ -371,6 +401,16 @@ class VllmEnginePort:
 
     def forget(self, request_id: str) -> None:
         self._signals.pop(request_id, None)
+        self._parked.pop(request_id, None)
+
+    def park(self, request: Request) -> None:
+        """Keep a finished request reachable while its KV is still cached.
+
+        Called instead of `forget`. `residents()` prunes it as soon as the
+        block pool reports no cached blocks under its id, so the map is bounded
+        by the cache, not by the run.
+        """
+        self._parked[request.request_id] = request
 
     def view(self, request: Request) -> VllmRequest:
         return VllmRequest(
@@ -396,8 +436,56 @@ class VllmEnginePort:
             candidates.append(self.view(request))
         return candidates
 
+    def engine_stats(self) -> dict[str, int]:
+        """Who decided each cached block's eviction, policy or LRU.
+
+        The pair is the whole point: `prefix_evicted_by_policy` alone cannot
+        distinguish a ranking that decided every eviction from one that decided
+        two, and it was exactly that blindness -- a cache channel answered
+        1,800 times per run while vLLM's LRU made every real eviction -- that
+        let eight prefix-caching replications be measured against a decision
+        they never made.
+        """
+        return self.scheduler.kv_cache_manager.block_pool.plex_eviction_stats()
+
     def residents(self) -> list[VllmRequest]:
-        return [self.view(request) for request in self.scheduler.running]
+        """What the policy may reclaim, cached prefixes first.
+
+        For a long time this was `scheduler.running`, which is the set vLLM
+        offers when it is about to *preempt* -- a live request whose KV is
+        referenced. That is a real decision, but it is not the one the
+        prefix-caching papers describe and it is not the one `prefix_hit_rate`
+        measures: every actual prefix eviction happens in `BlockPool`, off the
+        LRU tail of the free queue, and never reached PLEX at all. A policy
+        replicating Preble or Peek was ranking preemption victims while
+        believing it was ranking cache entries.
+
+        Both are published now, and they are distinguishable: a parked resident
+        reports `state_kind: retracted` and a size drawn from its cached blocks,
+        a running one reports `resident`. Cached prefixes come first because a
+        policy that reclaims the least it can should reach for the entry nobody
+        is using before it reaches for a running request.
+        """
+        scheduler = self.scheduler
+        census = scheduler.kv_cache_manager.block_pool.plex_cached_owners()
+        residents: list[VllmRequest] = []
+        for request_id in list(self._parked):
+            blocks = census.get(request_id, 0)
+            if blocks == 0:
+                # Its last cached block was evicted or hit; there is nothing
+                # left to rank and nothing left to keep it alive for.
+                self.forget(request_id)
+                continue
+            residents.append(
+                VllmRequest(
+                    self._parked[request_id],
+                    scheduler,
+                    self._signals.get(request_id),
+                    cached_blocks=blocks,
+                )
+            )
+        residents.extend(self.view(request) for request in scheduler.running)
+        return residents
 
     def capacity(self) -> ScheduleCapacity:
         scheduler = self.scheduler
@@ -411,16 +499,38 @@ class VllmEnginePort:
         )
 
     def cache_capacity(self, residents: list[VllmRequest]) -> CacheCapacity:
-        """Budget one unit less than the residents occupy.
+        """Budget the shortfall the engine is about to take from the cache.
 
-        vLLM asks only when it is about to preempt something, so the answer it
-        needs is which request to drop. Budgeting the resident total would let
-        a plan that frees nothing be valid, and vLLM would then preempt on its
-        own having asked for nothing.
+        This used to budget exactly one unit less than the residents occupy,
+        which asks "which single request do I drop" -- the right question for
+        preemption, and the only question the cache channel used to reach.
+        Now that the channel drives prefix eviction, a one-victim plan is a
+        near-empty answer: measured live, the policy decided 147 of 38,785
+        prefix evictions (0.4%) because it named one resident and vLLM's LRU
+        took every block after that resident's few ran out.
+
+        So the demand is the real deficit: how far below the pressure line the
+        free pool has fallen, converted to residents at their mean size. The
+        policy then ranks enough residents to cover what the engine will
+        actually take before it asks again.
+
+        Capped at the number of residents whose KV is genuinely reclaimable.
+        Demanding more than can be freed makes every plan over budget, and the
+        contract refuses an over-budget plan *whole* -- which is the S6.24
+        defect class, and it would turn a starved channel into a dead one.
         """
         unit = reclaim_unit(self.scheduler)
+        pool = self.scheduler.kv_cache_manager.block_pool
+        census = pool.plex_cached_owners()
+        cached_blocks = sum(census.values())
+        deficit = max(pool.num_gpu_blocks // 2 - pool.get_num_free_blocks(), 0)
+        wanted = 1
+        if deficit and cached_blocks and census:
+            mean = max(cached_blocks // len(census), 1)
+            wanted = -(-deficit // mean)
+        wanted = max(1, min(wanted, len(census) or 1, max(len(residents), 1)))
         return CacheCapacity(
-            max_bytes=max(unit * len(residents) - unit, 0),
+            max_bytes=max(unit * len(residents) - unit * wanted, 0),
             fixed_bytes=0,
             facts={"virtual_request_pressure": True},
         )
@@ -599,6 +709,7 @@ class AsyncPlexPolicyController:
     ) -> None:
         self.controller = controller
         self.port = port
+        self._eviction_order: list[str] | None = None
 
     @classmethod
     def from_policy(
@@ -624,12 +735,32 @@ class AsyncPlexPolicyController:
             ) from error
         port = VllmEnginePort(scheduler)
         logger.info("Enabling PLEX with policy %s", policy)
-        return cls(
+        controller = cls(
             PolicyController.from_policy(
                 policy, port, model=model, target_id=target_id
             ),
             port,
         )
+        # Hand vLLM's prefix eviction to the policy. Without this the cache
+        # channel only ever reaches `scheduler.py`'s preemption path, and every
+        # real eviction stays with the LRU free queue.
+        scheduler.kv_cache_manager.block_pool.set_plex_eviction_order(
+            controller.eviction_order
+        )
+        return controller
+
+    def eviction_order(self) -> list[str]:
+        """Request ids whose cached prefix the policy wants gone first.
+
+        Memoised for the step. `BlockPool.get_new_blocks` runs many times per
+        scheduler step and this is on that path, so polling the runtime per
+        allocation would put a PyO3 call between vLLM and every block it takes.
+        Within one step the answer cannot usefully change: the policy is not
+        being asked again until the next `publish`.
+        """
+        if self._eviction_order is None:
+            self._eviction_order = self.controller.cached_reclaim_order()
+        return self._eviction_order
 
     def tracks(self, engine_id: str) -> bool:
         return self.controller.tracks(engine_id)
@@ -664,7 +795,9 @@ class AsyncPlexPolicyController:
 
     def mark_finished(self, request: Request, reason: str) -> None:
         self.controller.mark_finished(self.port.view(request), reason)
-        self.port.forget(request.request_id)
+        # Not `forget`: its KV may still be in the prefix cache, and while it is
+        # the request is a cache resident the policy is entitled to rank.
+        self.port.park(request)
 
     def mark_cache_enacted(
         self, decision: CacheDecision, preempted: Request | None
@@ -675,6 +808,10 @@ class AsyncPlexPolicyController:
         self.controller.publish()
 
     def poll_schedule(self) -> SchedulePlan | None:
+        # One step, one reading of the eviction order. Dropping the memo here
+        # rather than in `publish` keeps it tied to the step boundary the
+        # scheduler actually has.
+        self._eviction_order = None
         plan = self.controller.poll_schedule()
         # Actions staged while polling are applied here, before `schedule`
         # looks at a single request. Anything that arrived on the cache

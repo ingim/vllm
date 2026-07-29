@@ -500,7 +500,9 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        self.block_pool.free_blocks(
+            reversed(self.pop_blocks_for_free(request_id)), owner=request_id
+        )
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -593,7 +595,7 @@ class SingleTypeKVCacheManager(ABC):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self.block_pool.free_blocks(freed, owner=request_id)
 
     def remove_skipped_blocks(
         self,
@@ -1408,7 +1410,9 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    self.block_pool.free_blocks(
+                        [blocks[last_state_block_idx]], owner=request_id
+                    )
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
