@@ -161,7 +161,17 @@ class VllmRequest:
             "computation_length": (
                 request.num_prompt_tokens + len(request.output_token_ids)
             ),
-            "last_access_ms": self._signals.last_access_ms,
+            # The later of "this request last made progress" and "something hit
+            # this request's cached prefix". Only the first was reported, so a
+            # parked resident aged while new arrivals were reusing it -- and a
+            # recency-ranking policy evicted the hottest prefix in the pool.
+            "last_access_ms": max(
+                self._signals.last_access_ms,
+                self._scheduler.kv_cache_manager.block_pool.plex_owner_last_hit_ms(
+                    request.request_id
+                )
+                or 0,
+            ),
             # The state of the cached *object*, not of the request that owns
             # it. Publishing `request.status.name.lower()` here put vLLM's
             # request lifecycle ("waiting", "running") under a name SGLang

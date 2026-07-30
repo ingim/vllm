@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -232,6 +233,11 @@ class BlockPool:
         #: which pointer the block arrived through, not who decided it.
         self._plex_evicted_no_ranking = 0
         self._plex_evict_diverged = 0
+        #: When each owner's cached prefix was last *hit*, which is the only
+        #: evidence a resident is still worth keeping. Read by the port for
+        #: `last_access_ms`, which otherwise only advanced while the request was
+        #: itself running.
+        self._plex_owner_hit_ms: dict[str, int] = {}
         #: Coverage of the ranking itself, which is what decides the split
         #: above. `_cache_order` holds only the residents the policy *named*,
         #: and the ask names exactly as many as `max_bytes` forces it to, so a
@@ -868,6 +874,10 @@ class BlockPool:
             for owner, blocks in self._plex_owner_blocks.items()
         }
 
+    def plex_owner_last_hit_ms(self, owner: str) -> int | None:
+        """When this owner's cached prefix was last hit, if ever."""
+        return self._plex_owner_hit_ms.get(owner)
+
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -908,6 +918,15 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                # A hit is the one moment a cached prefix is demonstrably
+                # useful, and it is the moment its owner's recency should be
+                # refreshed. The port only touches on progress, so a parked
+                # resident being hit by new arrivals went on ageing while it was
+                # the hottest thing in the pool -- and a recency-ranking policy
+                # then evicted exactly the prefix everyone was reusing.
+                owner = self._plex_cached_owner.get(block.block_id)
+                if owner is not None:
+                    self._plex_owner_hit_ms[owner] = int(time.time() * 1000)
                 # A block that has been hit is live again and no longer a
                 # cache resident anyone can rank; leaving it mapped would let
                 # the policy nominate a block it cannot have and silently fall
