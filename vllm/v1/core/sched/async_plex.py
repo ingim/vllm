@@ -128,7 +128,13 @@ class VllmRequest:
             "cache_ready": (
                 request.num_computed_tokens > 0 or hit > 0
             ),
-            "cached_tokens": request.num_computed_tokens,
+            # A waiting request has computed nothing, so `num_computed_tokens`
+            # is 0 for every arrival however much of it the cache already holds
+            # -- and a policy ordering the queue by cache affinity then sorts a
+            # column of zeros and collapses to arrival order. The prefix probe
+            # two lines down is the quantity meant here; `num_computed_tokens`
+            # is the right answer only once the request is running.
+            "cached_tokens": request.num_computed_tokens if running else hit,
             "prompt_tokens": prompt_tokens,
             "computation_length": prompt_tokens + len(request.output_token_ids),
             "lpm_hit_tokens": hit,
