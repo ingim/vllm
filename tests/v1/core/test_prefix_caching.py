@@ -4391,6 +4391,67 @@ def test_plex_spends_free_blocks_before_the_ranking():
     assert pool.plex_cached_owners() == {"A": 2, "B": 2}
 
 
+def test_plex_counts_evictions_taken_with_no_ranking_live():
+    """An eviction the policy had no answer for belongs to neither counter.
+
+    Leaving it out of both made `by_policy / (by_policy + by_lru)` read as the
+    policy's share of prefix evictions when it was only its share of the
+    evictions that happened while it was holding an answer -- and that ratio is
+    what the post-mortem used to argue the wiring was fixed.
+    """
+    # Sized so nothing uncached is left: an empty page is spent before the
+    # ranking, so a larger pool would never reach the eviction path at all.
+    pool = _plex_pool(5)
+    first = _plex_seed(pool, "A", 4)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+    pool.set_plex_eviction_order(list)  # attached, and holding nothing
+
+    pool.get_new_blocks(3)
+
+    stats = pool.plex_eviction_stats()
+    assert stats["prefix_evicted_by_policy"] == 0
+    assert stats["prefix_evicted_by_lru"] == 0
+    assert stats["prefix_evicted_no_ranking"] > 0
+
+
+def test_plex_separates_an_lru_mimic_from_a_policy_that_decides():
+    """`by_policy` alone cannot tell the two apart, and they need opposite fixes.
+
+    A policy that ranks by recency reproduces LRU's eviction sequence exactly
+    while being credited for every block it names. The divergence counter is the
+    difference between measuring who decided and measuring which pointer the
+    block arrived through.
+    """
+    def evict_ranking(choice: str) -> BlockPool:
+        # Attached before the frees: ownership is only recorded while a policy
+        # is present, so a ranking installed afterwards has nothing to name.
+        pool = _plex_pool(5)
+        order: list[str] = []
+        pool.set_plex_eviction_order(lambda: list(order))
+        first = _plex_seed(pool, "A", 2)
+        second = _plex_seed(pool, "B", 2)
+        pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+        pool.free_blocks(pool.blocks[second[0] : second[-1] + 1], owner="B")
+        order[:] = [choice]
+        pool.get_new_blocks(2)
+        return pool
+
+    # "A" was freed first, so its blocks are what LRU would hand over next: a
+    # ranking naming "A" reproduces LRU's sequence exactly.
+    mimic_stats = evict_ranking("A").plex_eviction_stats()
+    decider_stats = evict_ranking("B").plex_eviction_stats()
+
+    # Both are credited identically by the counter that used to stand alone.
+    assert mimic_stats["prefix_evicted_by_policy"] > 0
+    assert (
+        decider_stats["prefix_evicted_by_policy"]
+        == mimic_stats["prefix_evicted_by_policy"]
+    )
+    # Only the divergence counter separates them.
+    assert mimic_stats["prefix_evict_diverged"] == 0
+    assert decider_stats["prefix_evict_diverged"] > 0
+
+
 def test_plex_hit_removes_a_block_from_the_resident_set():
     """A block a request hit is live again, so nobody may rank it."""
     pool = _plex_pool(5)

@@ -225,6 +225,13 @@ class BlockPool:
         #: exists to remove, and it applies to the fix as much as to the bug.
         self._plex_evicted_ranked = 0
         self._plex_evicted_lru = 0
+        #: The two counters the pair above could not be read without. Evictions
+        #: taken with no ranking live belong to neither of them, and a policy
+        #: that reproduces LRU is credited by `_plex_evicted_ranked` for every
+        #: block it names -- so without a divergence count the share measures
+        #: which pointer the block arrived through, not who decided it.
+        self._plex_evicted_no_ranking = 0
+        self._plex_evict_diverged = 0
         #: Coverage of the ranking itself, which is what decides the split
         #: above. `_cache_order` holds only the residents the policy *named*,
         #: and the ask names exactly as many as `max_bytes` forces it to, so a
@@ -748,7 +755,18 @@ class BlockPool:
             return self.free_block_queue.popleft_n(num_blocks)
         ranked = self._plex_eviction_order()
         if not ranked:
-            return self.free_block_queue.popleft_n(num_blocks)
+            # Counted, because it used to be counted nowhere. An eviction taken
+            # while the policy held no ranking is not the policy's and not the
+            # LRU fallback of a ranking either -- it is an interval in which the
+            # channel had no answer at all. Leaving it out of both counters made
+            # `by_policy / (by_policy + by_lru)` read as "the policy's share of
+            # prefix evictions" when it was only its share of the evictions that
+            # happened while it was holding an answer.
+            taken_unranked = self.free_block_queue.popleft_n(num_blocks)
+            self._plex_evicted_no_ranking += sum(
+                1 for block in taken_unranked if block.block_hash is not None
+            )
+            return taken_unranked
         # Blocks that cache nothing are free in both senses. Spending the
         # policy's ranking while one of those sits at the head would evict a
         # prefix to avoid using an empty page.
@@ -773,6 +791,15 @@ class BlockPool:
                     continue
                 if not self.free_block_queue.contains(block):
                     continue
+                # The counterfactual, and the whole reason this loop can be read
+                # as influence rather than as provenance: a policy that ranks by
+                # recency reproduces LRU exactly, and every block it names is
+                # still credited to it. Comparing the block against the one the
+                # free queue would have handed over next is what separates the
+                # two, and it is a single pointer read.
+                lru_next = self.free_block_queue.fake_free_list_head.next_free_block
+                if lru_next is not None and lru_next.block_id != block.block_id:
+                    self._plex_evict_diverged += 1
                 self.free_block_queue.remove(block)
                 self._plex_drop(block.block_id)
                 taken.add(block.block_id)
@@ -794,6 +821,13 @@ class BlockPool:
         return {
             "prefix_evicted_by_policy": self._plex_evicted_ranked,
             "prefix_evicted_by_lru": self._plex_evicted_lru,
+            # Cached blocks evicted while the policy held no ranking. The
+            # denominator the share used to be computed without.
+            "prefix_evicted_no_ranking": self._plex_evicted_no_ranking,
+            # Of the blocks credited to the policy, how many differed from the
+            # one LRU would have taken. `by_policy` without this is provenance;
+            # the pair is influence.
+            "prefix_evict_diverged": self._plex_evict_diverged,
             "rank_calls": self._plex_rank_calls,
             "rank_len_sum": self._plex_rank_len_sum,
             "rank_census_sum": self._plex_census_len_sum,
