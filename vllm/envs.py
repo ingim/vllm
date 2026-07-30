@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     VLLM_LOGGING_LEVEL: str = "INFO"
     PLEX_ADMISSION_CONTROL: bool = False
     PLEX_SCHEDULE_RANK_WAITING: bool = False
+    PLEX_SCHEDULE_ALLOW_DEMOTION: bool = False
+    PLEX_DEMOTION_LIMIT: int = 3
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -829,6 +831,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PLEX_SCHEDULE_RANK_WAITING": lambda: bool(
         int(os.getenv("PLEX_SCHEDULE_RANK_WAITING", "0"))
     ),
+    # Let a schedule plan displace a running request when the seat limit binds
+    # and the plan ranks a queued request above it. The demotion goes through
+    # `_preempt_request`, the same path `reset_prefix_cache` already uses to
+    # return a running request to the queue with no KV pressure involved. Off by
+    # default; see `experiments/regime-preregistration.md` section 7.9 for the
+    # falsifier this was written against.
+    "PLEX_SCHEDULE_ALLOW_DEMOTION": lambda: bool(
+        int(os.getenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "0"))
+    ),
+    # How many times one request may lose its seat before the engine stops
+    # offering it as a victim. Counts every preemption, including the KV-pressure
+    # ones the policy did not ask for, so the bound is on total displacement
+    # rather than on the policy's share of it.
+    "PLEX_DEMOTION_LIMIT": lambda: int(os.getenv("PLEX_DEMOTION_LIMIT", "3")),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages

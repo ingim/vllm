@@ -451,6 +451,9 @@ class VllmEnginePort:
         self._probed_tokens = 0
         self._hit_tokens = 0
         self._pending_finish: set[str] = set()
+        # Insertion-ordered: the policy's own order among the requests it
+        # named is the order their seats are taken.
+        self._pending_pause: dict[str, None] = {}
         self._aborted: list[tuple[str, int]] = []
         # Requests that have left the scheduler but whose KV is still in the
         # prefix cache. They are the only reason a prefix eviction has anything
@@ -657,10 +660,14 @@ class VllmEnginePort:
         queued: not because the engine refused the decision, but because the
         port never let the policy express it.
 
-        Lifting the cap changes no vLLM invariant. The seat-limit break stays,
-        the engine still admits only as slots free, and it still never demotes a
-        running request. The one thing that changes is which waiting request
-        takes a freed seat: native FIFO before, the policy's ranking after.
+        Lifting the cap changes no vLLM invariant. The seat-limit break stays
+        and the engine still admits only as slots free. The one thing that
+        changes is which waiting request takes a freed seat: native FIFO before,
+        the policy's ranking after. Whether a seat frees at all is a separate
+        decision and a separate flag -- `request.pause@1`, negotiated under
+        `PLEX_SCHEDULE_ALLOW_DEMOTION` -- because a ranking that cannot be acted
+        on and an engine that will not free a seat are two different reasons for
+        the same flat line, and a single flag would have confounded them.
 
         Bounded by the protocol's working-set limit because that is what the
         controller will actually submit -- it takes a leading prefix of
@@ -814,16 +821,36 @@ class VllmEnginePort:
     #                              selection can be admitted in part. This is
     #                              the same reason `max_requests_per_selection`
     #                              is 1.
-    #   request.pause@1            vLLM preempts on its own terms and has no
-    #                              entry point to park a named request with its
-    #                              state preserved.
     #   cache.prefetch@1           no API to warm a prefix that is not attached
     #   cache.move@1               to a request already in the engine.
     #   request.rebalance@1        one engine, nowhere to rebalance to.
-    mechanics = ("request.finish@1", "group.cancel@1")
+    #
+    # `request.pause@1` used to be on that list, on the grounds that vLLM
+    # "preempts on its own terms and has no entry point to park a named request
+    # with its state preserved". The second half is true and the first is not:
+    # `Scheduler._preempt_request` names a request, frees its blocks and returns
+    # it to the waiting queue, and `reset_prefix_cache` already calls it with no
+    # KV pressure involved. So the port negotiates the mechanic and refuses the
+    # half it cannot do -- see `enact`.
+    BASE_MECHANICS = ("request.finish@1", "group.cancel@1")
+
+    @property
+    def mechanics(self) -> tuple[str, ...]:
+        """What this port will enact, which is not a fixed list.
+
+        `request.pause@1` is negotiated only under
+        `PLEX_SCHEDULE_ALLOW_DEMOTION`, so a run with it and a run without it
+        are the same build and differ in one declared line of the handshake. A
+        policy reads `meta.has_mechanic` and takes its own other branch when it
+        is absent, which is the behaviour under test: the corpus's four pausing
+        policies were written against an engine that offers this.
+        """
+        if envs.PLEX_SCHEDULE_ALLOW_DEMOTION:
+            return (*self.BASE_MECHANICS, "request.pause@1")
+        return self.BASE_MECHANICS
 
     def enact(self, method: str, args: dict[str, Any]) -> bool:
-        """Accept a finish or cancel, to be applied before the next decision.
+        """Accept a finish, cancel or pause, applied before the next decision.
 
         The work is queued rather than done here. `enact` is reached from
         inside `Scheduler.schedule`, and `finish_requests` rebinds
@@ -858,7 +885,53 @@ class VllmEnginePort:
             return self._stage_finish(
                 [member for member in members if isinstance(member, str)]
             )
+        if method == "plex.request.pause@1":
+            return self._stage_pause(args)
         return False
+
+    def _stage_pause(self, args: dict[str, Any]) -> bool:
+        """Take a named request's seat away, if this engine can do what was asked.
+
+        Refusing rather than approximating, in all three cases below, because a
+        pause the policy believes happened and the engine did not perform is the
+        exact failure this port has already made once in the other direction --
+        an answer counted as influence when nothing downstream changed.
+
+        `kv: "preserve"` is refused outright. The contract's rule is that
+        preserved state MUST remain restorable without recomputation, and vLLM
+        V1 has one recovery path: recompute. The prefix cache *may* still hold
+        the blocks afterwards, which is not the same promise. This is why
+        `slos-serve` -- whose whole mechanism is declining a request while
+        keeping the tokens it already generated -- stays blocked on this engine,
+        and it is now blocked for a stated reason rather than for a missing
+        primitive.
+        """
+        request_id = args.get("request_id")
+        if not isinstance(request_id, str) or args.get("kv") not in (
+            "preserve",
+            "release",
+        ):
+            return False
+        if args.get("kv") == "preserve":
+            self.scheduler._plex_choice["pause_refused_preserve"] += 1
+            return False
+        request = self.scheduler.requests.get(request_id)
+        if request is None or request.is_finished():
+            # Naming a request the engine no longer has is not a failure: the
+            # policy ruled on a view one step old and the outcome already holds.
+            self.scheduler._plex_choice["pause_unknown_request"] += 1
+            return True
+        limit = envs.PLEX_DEMOTION_LIMIT
+        if limit > 0 and request.num_preemptions >= limit:
+            # The host's own bound on displacement, counting the KV-pressure
+            # preemptions the policy never asked for. Refused rather than
+            # dropped so the policy is told: a fairness policy that ranks by
+            # attained service will re-pause the same request every step, and
+            # one that cannot see the refusal will never learn to stop.
+            self.scheduler._plex_choice["pause_refused_bound"] += 1
+            return False
+        self._pending_pause[request_id] = None
+        return True
 
     def _stage_finish(self, request_ids: list[str]) -> bool:
         staged = [
@@ -881,15 +954,50 @@ class VllmEnginePort:
         has to be told. `finish_requests` only detaches the request inside the
         scheduler.
         """
+        drained = self._drain_pauses()
         if not self._pending_finish:
-            return 0
+            return drained
         request_ids = sorted(self._pending_finish)
         self._pending_finish.clear()
         finished = self.scheduler.finish_requests(
             request_ids, RequestStatus.FINISHED_ABORTED
         )
         self._aborted.extend(finished)
-        return len(finished)
+        return drained + len(finished)
+
+    def _drain_pauses(self) -> int:
+        """Return each paused request to the waiting queue.
+
+        Reached from the top of `poll_schedule`, so the seat is free before the
+        running loop looks at a single request and the waiting loop can spend it
+        this step rather than the next one. Requests that stopped running
+        between the answer and here are skipped: a request already waiting has
+        no seat to give up, and one that finished has nothing to pause.
+        """
+        if not self._pending_pause:
+            return 0
+        pending = self._pending_pause
+        self._pending_pause = {}
+        scheduler = self.scheduler
+        paused = 0
+        for request_id in pending:
+            request = scheduler.requests.get(request_id)
+            if (
+                request is None
+                or request.status != RequestStatus.RUNNING
+                or request not in scheduler.running
+            ):
+                # It lost its seat between the answer and here -- to KV pressure,
+                # or to another pause in this same batch. The policy asked for a
+                # state that already holds, so this is satisfied, not refused,
+                # and counted so a run cannot report it as a pause it performed.
+                scheduler._plex_choice["pause_not_running"] += 1
+                continue
+            scheduler.running.remove(request)
+            scheduler._preempt_request(request, time.monotonic(), initiator="policy")
+            scheduler._plex_choice["pause_enacted"] += 1
+            paused += 1
+        return paused
 
     def take_aborted(self) -> list[tuple[str, int]]:
         """Hand back the (request id, client index) pairs still unreported."""
@@ -1029,10 +1137,14 @@ class AsyncPlexPolicyController:
         )
 
     def mark_preempted(
-        self, request: Request, attained_service: int | None = None
+        self,
+        request: Request,
+        attained_service: int | None = None,
+        initiator: str = "host",
     ) -> None:
         self.controller.mark_preempted(
-            self.port.view(request, attained_service=attained_service)
+            self.port.view(request, attained_service=attained_service),
+            initiator=initiator,
         )
 
     def mark_finished(self, request: Request, reason: str) -> None:

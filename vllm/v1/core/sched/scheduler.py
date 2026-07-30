@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -387,6 +388,15 @@ class Scheduler(SchedulerInterface):
             # Admissions the plan carried no decision about, where the request
             # admitted was still not the one the engine would have chosen.
             "unseen_diverged": 0,
+            # `request.pause@1`. The mechanic the contract already defines for
+            # this, negotiated once it turned out vLLM can enact half of it.
+            # `pause_refused_preserve` is the other half, and it is the reason
+            # slos-serve stays blocked: it wants the generated tokens kept.
+            "pause_enacted": 0,
+            "pause_refused_preserve": 0,
+            "pause_refused_bound": 0,
+            "pause_unknown_request": 0,
+            "pause_not_running": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -1390,11 +1400,19 @@ class Scheduler(SchedulerInterface):
 
         return new_block_ids_to_zero or None
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self, request: Request, timestamp: float, initiator: str = "host"
+    ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
         method.
+
+        `initiator` is what the policy is told on the feedback channel.
+        `docs/plex_0.7.md` section 13 makes it a MUST that a host preempting for
+        its own reasons says so; the same rule makes a policy-requested
+        transition say `policy`, and until `request.pause@1` was negotiated
+        there was no way to reach that branch.
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -1420,7 +1438,9 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
         if self.plex is not None:
-            self.plex.mark_preempted(request, attained_service=attained_service)
+            self.plex.mark_preempted(
+                request, attained_service=attained_service, initiator=initiator
+            )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER

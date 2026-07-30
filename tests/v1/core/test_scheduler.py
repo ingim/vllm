@@ -6618,16 +6618,27 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.request_id not in req_to_blocks
 
 
-def test_plex_port_negotiates_only_what_vllm_enacts():
+@pytest.mark.parametrize("allow_pause", [False, True])
+def test_plex_port_negotiates_only_what_vllm_enacts(monkeypatch, allow_pause):
     """A mechanic vLLM cannot honour must not be offered to the policy.
 
     `schedule.atomic-enqueue@1` is the one worth pinning: the running loop
     stops on the token budget, so a selection can be admitted in part. The
     same fact is already recorded as `max_requests_per_selection == 1`, and
     the two must not drift apart.
+
+    `request.pause@1` is the one that moves. It is negotiated only under
+    `PLEX_SCHEDULE_ALLOW_DEMOTION`, so the flagged and unflagged runs are the
+    same build differing in one declared line of the handshake -- and a policy
+    that branches on `meta.has_mechanic` takes a genuinely different path in
+    each, which is what makes the pair a measurement rather than two builds.
     """
+    monkeypatch.setenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "1" if allow_pause else "0")
     port = VllmEnginePort(create_scheduler())
-    assert set(port.mechanics) == {"request.finish@1", "group.cancel@1"}
+    expected = {"request.finish@1", "group.cancel@1"}
+    if allow_pause:
+        expected.add("request.pause@1")
+    assert set(port.mechanics) == expected
     assert "schedule.atomic-enqueue@1" not in port.mechanics
     assert port.max_requests_per_selection == 1
 
@@ -6968,3 +6979,223 @@ def test_plex_admits_natively_when_the_policy_never_answers(monkeypatch):
     assert set(scheduler.schedule().num_scheduled_tokens) == {
         request.request_id
     }, "past the deadline the engine admits on its own terms"
+
+
+def _plex_pause_fixture(
+    monkeypatch, *, allow: bool, kv: str = "release", limit: int = 3,
+    already_displaced: int = 0, name: str | None = None,
+):
+    """Two seats, three requests, and a policy that pauses one to admit another.
+
+    The seat limit binds, so without `request.pause@1` the queued request cannot
+    be admitted however the policy ranks it -- which is the state the schedule
+    channel spends most of a loaded run in.
+    """
+    monkeypatch.setenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "1" if allow else "0")
+    monkeypatch.setenv("PLEX_DEMOTION_LIMIT", str(limit))
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(num_blocks=64, block_size=16, max_num_seqs=2)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=3, num_tokens=40, max_tokens=16)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    # The precondition the change is about: seats full, something queued behind
+    # them. Pinned before anything else, because a fixture that quietly admitted
+    # all three would let every assertion below pass while exercising nothing.
+    running = [r for r in requests if r.status == RequestStatus.RUNNING]
+    queued = [r for r in requests if r.status == RequestStatus.WAITING]
+    assert len(running) == 2 and len(queued) == 1
+    first, second = running
+    third = queued[0]
+    second.num_preemptions = already_displaced
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    event = next(
+        event
+        for channel, _epoch, event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    ids = [entry["request"]["request_id"] for entry in event["context"]["runnable"]]
+    index = {
+        request.request_id: next(
+            i for i, name in enumerate(ids) if name.endswith(request.request_id)
+        )
+        for request in requests
+    }
+    # The mechanic carries the engine-scoped id the policy was given, not the
+    # engine's own -- the same name it reads back on the feedback channel.
+    subject = second if name is None else {"queued": third}[name]
+    paused = ids[index[subject.request_id]]
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [index[third.request_id]], "token_budgets": [40]},
+                        {"requests": [index[first.request_id]], "token_budgets": [8]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [
+                {
+                    "mechanic": "request.pause@1",
+                    "method": "plex.request.pause@1",
+                    "args": {
+                        "request_id": paused,
+                        "kv": kv,
+                        "idempotency_key": "pause-1",
+                    },
+                }
+            ],
+        },
+    )
+    scheduler.schedule()
+    return scheduler, runtime, first, second, third
+
+
+def test_plex_a_policy_can_take_a_seat_from_a_running_request(monkeypatch):
+    """`request.pause@1`, enacted, which reaches the whole schedule channel.
+
+    vLLM breaks out of the waiting loop the moment the seat limit binds, so a
+    policy's ranking of the queue decides nothing during the 63.7% of steps that
+    break there -- measured with a queue 85 deep. The port declined this mechanic
+    on the grounds that vLLM "has no entry point to park a named request";
+    `reset_prefix_cache` has been calling exactly such an entry point, with no KV
+    pressure involved, the whole time.
+
+    Before this change the action below is refused, the request keeps its seat,
+    and the queued request stays queued.
+    """
+    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=True
+    )
+    assert second.status == RequestStatus.PREEMPTED
+    assert second.num_computed_tokens == 0
+    assert third.status == RequestStatus.RUNNING
+    assert scheduler._plex_choice["pause_enacted"] == 1
+
+
+def test_plex_pause_is_reported_as_the_policys_own_transition(monkeypatch):
+    """`initiator` separates a pause the policy asked for from one it suffered.
+
+    Section 13 makes this a MUST in both directions, and the `policy` branch was
+    unreachable until a binding enacted the mechanic -- so every preemption any
+    policy had ever seen said `host`, including the ones it caused.
+    """
+    scheduler, runtime, _first, second, _third = _plex_pause_fixture(
+        monkeypatch, allow=True
+    )
+    assert scheduler._plex_choice["pause_enacted"] == 1
+    # The fixture already published once, so a feedback delivery is inflight and
+    # unanswered; the controller will not open a second until it is acked.
+    inflight = max(
+        (epoch for channel, epoch, _ in runtime.submissions if channel == "feedback"),
+        default=0,
+    )
+    runtime.latest_results["feedback"] = (inflight, {"status": "success"})
+    scheduler.publish_plex()
+
+    def facts_of(node):
+        if isinstance(node, dict):
+            if "initiator" in (node.get("facts") or {}):
+                yield node["facts"]
+            for value in node.values():
+                yield from facts_of(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from facts_of(value)
+
+    pauses = [
+        facts
+        for channel, _epoch, event in runtime.submissions
+        if channel == "feedback"
+        for facts in facts_of(event)
+        if facts.get("preempted")
+    ]
+    assert pauses, "the pause produced no feedback record at all"
+    assert all(facts["initiator"] == "policy" for facts in pauses)
+    # The service it lost, captured before the reset zeroes it.
+    assert all(facts["attained_service"] == 40 for facts in pauses)
+
+
+def test_plex_pause_is_off_by_default_so_both_states_are_one_build(monkeypatch):
+    """Flag off: the mechanic is not negotiated, so the action is refused."""
+    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=False
+    )
+    assert "request.pause@1" not in scheduler.plex.port.mechanics
+    assert second.status == RequestStatus.RUNNING
+    assert third.status == RequestStatus.WAITING
+    assert scheduler._plex_choice["pause_enacted"] == 0
+    assert scheduler._plex_choice["bound_by_seqs"] > 0
+
+
+def test_plex_pause_refuses_to_preserve_kv_it_cannot_restore(monkeypatch):
+    """`kv: "preserve"` promises restoration without recompute; V1 recomputes.
+
+    The port could free the blocks and call it preserved -- the prefix cache
+    often does still hold them -- and a policy would read an enacted pause and
+    believe its generated tokens survived. Refusing is why `slos-serve` stays
+    blocked on this engine, and it is now blocked for a stated reason rather
+    than for a primitive nobody had looked for.
+    """
+    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=True, kv="preserve"
+    )
+    assert second.status == RequestStatus.RUNNING
+    assert third.status == RequestStatus.WAITING
+    assert scheduler._plex_choice["pause_refused_preserve"] == 1
+    assert scheduler._plex_choice["pause_enacted"] == 0
+
+
+def test_plex_pause_is_bounded_so_a_policy_cannot_starve_a_request(monkeypatch):
+    """A request at the displacement bound keeps its seat, and is told so.
+
+    Without this a policy that ranks by anything correlated with being queued --
+    least-attained-service, and most of the fairness corpus -- re-pauses the same
+    request every step and it never finishes. The action is refused rather than
+    dropped: a policy that cannot see the refusal never learns to stop. The bound
+    counts KV-pressure preemptions the policy never asked for, so it limits total
+    displacement rather than the policy's share of it.
+    """
+    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=True, limit=1, already_displaced=1
+    )
+    assert second.status == RequestStatus.RUNNING
+    assert third.status == RequestStatus.WAITING
+    assert scheduler._plex_choice["pause_refused_bound"] == 1
+    assert scheduler._plex_choice["pause_enacted"] == 0
+
+
+def test_plex_pause_of_a_request_that_already_lost_its_seat_is_satisfied(monkeypatch):
+    """The policy asked for a state that already holds, so nothing is refused.
+
+    Requests lose seats between an answer and its enactment constantly -- to KV
+    pressure, to completion, to another pause in the same batch. Refusing here
+    would take the whole plan down, selections included, on most steps under
+    load, which is the failure mode this port has already had once: an
+    unrelated staleness check discarding answers wholesale and reporting the
+    channel as quiet.
+    """
+    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=True, name="queued"
+    )
+    assert scheduler._plex_choice["pause_not_running"] == 1
+    assert scheduler._plex_choice["pause_enacted"] == 0
+    assert second.status == RequestStatus.RUNNING
+    # The plan itself was not refused: its selections still applied, and the
+    # request it declined was deferred rather than scheduled.
+    assert scheduler._plex_choice["running_deferred"] == 1
+    assert third.status == RequestStatus.WAITING
