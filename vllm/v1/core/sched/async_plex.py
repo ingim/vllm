@@ -425,7 +425,6 @@ class VllmEnginePort:
         self._parked: dict[str, Request] = {}
         # Evictions charged at the previous `cache_capacity`; the difference is
         # what the engine consumed while the last plan was in force.
-        self._plex_last_evicted = 0
         # How many residents each ask told the policy to give up, against how
         # many it was offered. The ranking the engine later walks is exactly
         # the set the policy named, and it names only as many as `max_bytes`
@@ -664,27 +663,22 @@ class VllmEnginePort:
         contract refuses an over-budget plan *whole* -- which is the S6.24
         defect class, and it would turn a starved channel into a dead one.
 
-        The deficit alone is a *level*, and the engine consumes at a *rate*:
-        it evicts roughly 90 blocks/s while the channel is invoked ~2.5 times/s,
-        so a plan sized to the instantaneous shortfall is spent within
-        milliseconds and LRU decides the rest of the interval. The demand
-        therefore also carries what the engine actually took since the last
-        ask -- measured, not tuned, and self-correcting: if the ranking covers
-        the interval the LRU share falls and the observed rate stays put.
+        The deficit alone is a *level*, and the engine consumes at a *rate*: it
+        evicts roughly 90 blocks/s while the channel is invoked ~2.5 times/s, so
+        a plan sized to the instantaneous shortfall is spent within milliseconds
+        and LRU decides the rest of the interval.
+
+        A rate-based demand was computed here for exactly that reason and then
+        overridden two lines later by `max(wanted, len(census))`, which asks for
+        the whole census unconditionally -- so the docstring described a
+        self-correcting mechanism that the code did not run. The census-wide ask
+        is the behaviour that was actually measured (Preble 12.8% -> 34.5% of
+        prefix evictions), so the dead arithmetic is gone rather than the ask:
+        one fewer thing claiming to be measured when it is not.
         """
         unit = reclaim_unit(self.scheduler)
         pool = self.scheduler.kv_cache_manager.block_pool
         census = pool.plex_cached_owners()
-        cached_blocks = sum(census.values())
-        deficit = max(pool.num_gpu_blocks // 2 - pool.get_num_free_blocks(), 0)
-        stats = pool.plex_eviction_stats()
-        evicted = stats["prefix_evicted_by_policy"] + stats["prefix_evicted_by_lru"]
-        taken = max(evicted - self._plex_last_evicted, 0)
-        self._plex_last_evicted = evicted
-        wanted = 1
-        if cached_blocks and census:
-            mean = max(cached_blocks // len(census), 1)
-            wanted = -(-(deficit + taken) // mean)
         # Sizing the ask in bytes is still not enough, because the *answer* is
         # a list of requests and the engine spends it at allocation granularity.
         # Measured on ShareGPT: 119 residents offered per ask, 7.8 demanded, and
@@ -706,8 +700,20 @@ class VllmEnginePort:
         # into a dead one. Over-naming otherwise costs nothing: `_plex_take`
         # walks the order and takes only the blocks it needs, so a longer
         # ranking evicts no more, it just keeps deciding for longer.
-        wanted = max(wanted, len(census))
-        wanted = max(1, min(wanted, len(census) or 1, max(len(residents) - 1, 1)))
+        #
+        # The headroom has to survive the single-resident case, and it did not:
+        # flooring `wanted` at 1 while capping it at `len(residents) - 1` gave
+        # `wanted == 1` against one resident, so `max_bytes` was 0 and any plan
+        # retaining that resident was over budget and refused whole -- the S6.24
+        # class this paragraph exists to prevent, reached by the arithmetic meant
+        # to prevent it. Asking for nothing when there is nothing to spare is the
+        # honest answer, and it leaves a budget the policy can satisfy.
+        #
+        # Capping at the offered count also bounds a census that is wider than
+        # what `residents()` can offer -- preempted and locally-freed requests
+        # appear in it and are not rankable -- so an inflated census can no
+        # longer drive the budget to zero.
+        wanted = min(len(census), max(len(residents) - 1, 0))
         self._plex_ask_calls += 1
         self._plex_wanted_sum += wanted
         self._plex_offered_sum += len(residents)

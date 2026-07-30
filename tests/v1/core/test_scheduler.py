@@ -518,6 +518,35 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+@pytest.mark.parametrize(
+    "residents,census", [(1, 1), (1, 5), (2, 2), (5, 5), (5, 20)]
+)
+def test_plex_cache_budget_always_leaves_headroom(residents, census):
+    """A budget of zero refuses every plan that retains anything, whole.
+
+    `cache_capacity` floored the demand at 1 while capping it at
+    `len(residents) - 1`, so against a single resident it demanded 1 of 1 and
+    `max_bytes` came out 0 -- and the contract refuses an over-budget plan
+    entirely, which turns a starved channel into a dead one. That is the S6.24
+    class, reached by the arithmetic written to avoid it.
+
+    Capping at the offered count also bounds a census wider than what
+    `residents()` can offer: preempted and locally-freed requests appear in it
+    and are not rankable, and an inflated census used to drive the budget down.
+    """
+    from vllm.v1.core.sched.async_plex import VllmEnginePort, reclaim_unit
+
+    scheduler = create_scheduler(num_blocks=64, block_size=16)
+    port = VllmEnginePort(scheduler)
+    scheduler.kv_cache_manager.block_pool.plex_cached_owners = lambda: {
+        f"owner-{i}": 2 for i in range(census)
+    }
+
+    capacity = port.cache_capacity([object()] * residents)
+
+    assert capacity.max_bytes >= reclaim_unit(scheduler)
+
+
 def test_plex_parked_requests_do_not_accumulate_without_kv_pressure():
     """`park` retains a whole Request; only pressure used to release it.
 
