@@ -518,6 +518,38 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+def test_plex_parked_requests_do_not_accumulate_without_kv_pressure():
+    """`park` retains a whole Request; only pressure used to release it.
+
+    The single caller of `forget` was `residents()`, which the controller reaches
+    only while `under_pressure()`. So an engine that never crosses the pressure
+    line held one `Request` -- prompt and output token ids -- plus one
+    `RequestSignals` per completed request for the lifetime of the process, and
+    once the map grew past the working-set bound it began pushing real residents
+    out of the cache submission.
+    """
+    runtime = FakeAsyncRuntime()
+    # A pool large enough that free blocks never fall to half.
+    scheduler = create_scheduler(
+        num_blocks=4096, block_size=16, max_num_seqs=8, enable_prefix_caching=False
+    )
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=24, num_tokens=32, max_tokens=2)
+    for request in requests:
+        scheduler.add_request(request)
+    for _ in range(80):
+        output = scheduler.schedule()
+        if not output.num_scheduled_tokens:
+            break
+        _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    port = scheduler.plex.port
+    assert all(request.is_finished() for request in requests)
+    assert not port.under_pressure(), "the fixture must never reach pressure"
+    assert port._parked == {}
+    assert port._signals == {}
+
+
 def test_plex_preemption_walks_past_a_victim_that_is_not_running():
     """The head of a worst-first ranking is routinely un-preemptable.
 

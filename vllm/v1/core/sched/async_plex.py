@@ -527,6 +527,31 @@ class VllmEnginePort:
             stats[f"sched_{key}"] = value
         return stats
 
+    def prune_parked(self) -> int:
+        """Drop parked requests the block pool no longer holds any KV for.
+
+        `park` retains a whole `Request` -- prompt and output token ids -- for
+        every finished request, and the only place `forget` was ever called from
+        is `residents()`, which the controller reaches only while
+        `under_pressure()`. So an engine that never crosses the pressure line
+        retained one `Request` plus one `RequestSignals` per completed request
+        for the lifetime of the process, and once `_parked` grew past the
+        working-set bound it began pushing real residents out of the cache
+        submission.
+
+        Called from `poll_schedule`, which runs every step, so the map is bounded
+        by the cache as its docstring always claimed.
+        """
+        if not self._parked:
+            return 0
+        census = self.scheduler.kv_cache_manager.block_pool.plex_cached_owners()
+        stale = [
+            request_id for request_id in self._parked if request_id not in census
+        ]
+        for request_id in stale:
+            self.forget(request_id)
+        return len(stale)
+
     def take_prefix_evictions(self) -> dict[str, int]:
         """Owners the ranking evicted since the last call, for feedback.
 
@@ -973,6 +998,8 @@ class AsyncPlexPolicyController:
         # rather than in `publish` keeps it tied to the step boundary the
         # scheduler actually has.
         self._eviction_order = None
+        # Bound `_parked` on the step boundary rather than only under pressure.
+        self.port.prune_parked()
         plan = self.controller.poll_schedule()
         # Actions staged while polling are applied here, before `schedule`
         # looks at a single request. Anything that arrived on the cache
