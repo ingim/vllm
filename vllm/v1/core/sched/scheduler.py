@@ -1442,6 +1442,31 @@ class Scheduler(SchedulerInterface):
                 request, attained_service=attained_service, initiator=initiator
             )
 
+    def preempt_out_of_band(
+        self, request: Request, timestamp: float, initiator: str = "host"
+    ) -> None:
+        """Preempt a request from outside the scheduling loops.
+
+        The caller must already have removed it from `self.running`.
+
+        Every out-of-band preemption needs the async-scheduling correction
+        below, and the ones inside `schedule` do not: there the request is being
+        preempted in the same step that would have given it placeholders, so
+        there are none in flight. Reaching the same seam from two places without
+        sharing this was a fatal assertion in `_update_request_with_output` --
+        `num_output_placeholders` went negative the first time a policy paused a
+        request under load, on a code path `reset_prefix_cache` had had right
+        since it was written.
+
+        For async scheduling, any output frames already in flight at preemption
+        time are stale and must be discarded when they return.
+        `num_output_placeholders` is exactly that count: 0 if the engine has
+        drained, 1 for vanilla async mid-step, or 1 + spec/PP frames otherwise.
+        """
+        self._preempt_request(request, timestamp, initiator=initiator)
+        request.async_tokens_to_discard = request.num_output_placeholders
+        request.num_output_placeholders = 0
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
@@ -2709,16 +2734,7 @@ class Scheduler(SchedulerInterface):
             # Preempt in reverse order so the requests will be added back to the
             # running queue in FIFO order.
             while self.running:
-                request = self.running.pop()
-                self._preempt_request(request, timestamp)
-                # For async scheduling, any output frames already in flight at
-                # preemption time are now stale and must be discarded when they
-                # return. num_output_placeholders is exactly that count: 0 if
-                # the engine has drained (e.g. pause_generation(keep) waited
-                # for idle), 1 for vanilla async mid-step, or 1 + spec/PP frames
-                # otherwise.
-                request.async_tokens_to_discard = request.num_output_placeholders
-                request.num_output_placeholders = 0
+                self.preempt_out_of_band(self.running.pop(), timestamp)
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were

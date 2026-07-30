@@ -994,7 +994,9 @@ class VllmEnginePort:
                 scheduler._plex_choice["pause_not_running"] += 1
                 continue
             scheduler.running.remove(request)
-            scheduler._preempt_request(request, time.monotonic(), initiator="policy")
+            scheduler.preempt_out_of_band(
+                request, time.monotonic(), initiator="policy"
+            )
             scheduler._plex_choice["pause_enacted"] += 1
             paused += 1
         return paused

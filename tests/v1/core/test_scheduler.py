@@ -6984,6 +6984,7 @@ def test_plex_admits_natively_when_the_policy_never_answers(monkeypatch):
 def _plex_pause_fixture(
     monkeypatch, *, allow: bool, kv: str = "release", limit: int = 3,
     already_displaced: int = 0, name: str | None = None,
+    async_scheduling: bool = False, feed_output: bool = True,
 ):
     """Two seats, three requests, and a policy that pauses one to admit another.
 
@@ -6994,13 +6995,19 @@ def _plex_pause_fixture(
     monkeypatch.setenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "1" if allow else "0")
     monkeypatch.setenv("PLEX_DEMOTION_LIMIT", str(limit))
     runtime = FakeAsyncRuntime()
-    scheduler = create_scheduler(num_blocks=64, block_size=16, max_num_seqs=2)
+    scheduler = create_scheduler(
+        num_blocks=64,
+        block_size=16,
+        max_num_seqs=2,
+        async_scheduling=async_scheduling,
+    )
     attach_plex(scheduler, runtime)
     requests = create_requests(num_requests=3, num_tokens=40, max_tokens=16)
     for request in requests:
         scheduler.add_request(request)
     output = scheduler.schedule()
-    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+    if feed_output:
+        _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
 
     # The precondition the change is about: seats full, something queued behind
     # them. Pinned before anything else, because a fixture that quietly admitted
@@ -7061,8 +7068,8 @@ def _plex_pause_fixture(
             ],
         },
     )
-    scheduler.schedule()
-    return scheduler, runtime, first, second, third
+    final = scheduler.schedule()
+    return scheduler, runtime, final, output, first, second, third
 
 
 def test_plex_a_policy_can_take_a_seat_from_a_running_request(monkeypatch):
@@ -7078,7 +7085,7 @@ def test_plex_a_policy_can_take_a_seat_from_a_running_request(monkeypatch):
     Before this change the action below is refused, the request keeps its seat,
     and the queued request stays queued.
     """
-    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+    scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=True
     )
     assert second.status == RequestStatus.PREEMPTED
@@ -7094,7 +7101,7 @@ def test_plex_pause_is_reported_as_the_policys_own_transition(monkeypatch):
     unreachable until a binding enacted the mechanic -- so every preemption any
     policy had ever seen said `host`, including the ones it caused.
     """
-    scheduler, runtime, _first, second, _third = _plex_pause_fixture(
+    scheduler, runtime, _final, _out, _first, second, _third = _plex_pause_fixture(
         monkeypatch, allow=True
     )
     assert scheduler._plex_choice["pause_enacted"] == 1
@@ -7132,7 +7139,7 @@ def test_plex_pause_is_reported_as_the_policys_own_transition(monkeypatch):
 
 def test_plex_pause_is_off_by_default_so_both_states_are_one_build(monkeypatch):
     """Flag off: the mechanic is not negotiated, so the action is refused."""
-    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+    scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=False
     )
     assert "request.pause@1" not in scheduler.plex.port.mechanics
@@ -7151,7 +7158,7 @@ def test_plex_pause_refuses_to_preserve_kv_it_cannot_restore(monkeypatch):
     blocked on this engine, and it is now blocked for a stated reason rather
     than for a primitive nobody had looked for.
     """
-    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+    scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=True, kv="preserve"
     )
     assert second.status == RequestStatus.RUNNING
@@ -7170,7 +7177,7 @@ def test_plex_pause_is_bounded_so_a_policy_cannot_starve_a_request(monkeypatch):
     counts KV-pressure preemptions the policy never asked for, so it limits total
     displacement rather than the policy's share of it.
     """
-    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+    scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=True, limit=1, already_displaced=1
     )
     assert second.status == RequestStatus.RUNNING
@@ -7189,7 +7196,7 @@ def test_plex_pause_of_a_request_that_already_lost_its_seat_is_satisfied(monkeyp
     unrelated staleness check discarding answers wholesale and reporting the
     channel as quiet.
     """
-    scheduler, _runtime, _first, second, third = _plex_pause_fixture(
+    scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=True, name="queued"
     )
     assert scheduler._plex_choice["pause_not_running"] == 1
@@ -7199,3 +7206,33 @@ def test_plex_pause_of_a_request_that_already_lost_its_seat_is_satisfied(monkeyp
     # request it declined was deferred rather than scheduled.
     assert scheduler._plex_choice["running_deferred"] == 1
     assert third.status == RequestStatus.WAITING
+
+
+def test_plex_pause_discards_the_output_frames_already_in_flight(monkeypatch):
+    """An out-of-band preemption has to retire the async frames it orphans.
+
+    With async scheduling a step's output lands one step later, so a request
+    paused at the top of a step has placeholders outstanding for work that will
+    never be counted against it. `num_output_placeholders` then goes negative and
+    `_update_request_with_output` dies on an assertion, killing the engine core.
+
+    Measured: this fired the first time a policy paused a request under real
+    load, at 1,536 requests against 64 seats. `reset_prefix_cache` has had the
+    correction since it was written; the pause path reached the same seam
+    without it, which is why both now go through one helper.
+    """
+    scheduler, _runtime, _final, first_step, _first, second, _third = (
+        _plex_pause_fixture(
+            monkeypatch, allow=True, async_scheduling=True, feed_output=False
+        )
+    )
+    assert scheduler._plex_choice["pause_enacted"] == 1
+    assert second.status == RequestStatus.PREEMPTED
+    # The frames in flight at the moment of the pause, moved to the discard
+    # counter rather than left to be subtracted from a request that will never
+    # be credited with them.
+    assert second.async_tokens_to_discard >= 1
+    assert second.num_output_placeholders == 0
+    # The stale frame arriving is absorbed rather than fatal.
+    _model_output(scheduler, first_step, [[100]] * len(first_step.num_scheduled_tokens))
+    assert second.num_output_placeholders == 0
