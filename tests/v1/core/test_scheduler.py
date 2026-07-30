@@ -7170,12 +7170,15 @@ def test_plex_pause_refuses_to_preserve_kv_it_cannot_restore(monkeypatch):
 def test_plex_pause_is_bounded_so_a_policy_cannot_starve_a_request(monkeypatch):
     """A request at the displacement bound keeps its seat, and is told so.
 
-    Without this a policy that ranks by anything correlated with being queued --
-    least-attained-service, and most of the fairness corpus -- re-pauses the same
-    request every step and it never finishes. The action is refused rather than
-    dropped: a policy that cannot see the refusal never learns to stop. The bound
-    counts KV-pressure preemptions the policy never asked for, so it limits total
-    displacement rather than the policy's share of it.
+    Off by default, and this pins what it does when a run turns it on. It is off
+    because measuring it at 3 showed the cure is worse: the refusal discards the
+    whole plan, so one request at the bound cancels every selection beside it,
+    and the channel's live-plan share fell from 451 steps to 23. The contract
+    puts this decision with the policy and publishes `preemptions` per request so
+    it can make it.
+
+    The bound counts KV-pressure preemptions the policy never asked for, so it
+    limits total displacement rather than the policy's share of it.
     """
     scheduler, _runtime, _final, _out, _first, second, third = _plex_pause_fixture(
         monkeypatch, allow=True, limit=1, already_displaced=1

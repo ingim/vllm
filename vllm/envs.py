@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     PLEX_ADMISSION_CONTROL: bool = False
     PLEX_SCHEDULE_RANK_WAITING: bool = False
     PLEX_SCHEDULE_ALLOW_DEMOTION: bool = False
-    PLEX_DEMOTION_LIMIT: int = 3
+    PLEX_DEMOTION_LIMIT: int = 0
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -840,11 +840,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PLEX_SCHEDULE_ALLOW_DEMOTION": lambda: bool(
         int(os.getenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "0"))
     ),
-    # How many times one request may lose its seat before the engine stops
-    # offering it as a victim. Counts every preemption, including the KV-pressure
-    # ones the policy did not ask for, so the bound is on total displacement
-    # rather than on the policy's share of it.
-    "PLEX_DEMOTION_LIMIT": lambda: int(os.getenv("PLEX_DEMOTION_LIMIT", "3")),
+    # How many times one request may lose its seat before the host refuses to
+    # pause it again. 0 disables the bound, which is the default, because the
+    # contract puts this decision with the policy and publishes `preemptions`
+    # per request precisely so a policy can make it. Measured at 3: the refusal
+    # took the whole plan with it -- one ineligible request discarded every
+    # selection beside it -- and the schedule channel's live-plan share fell
+    # from 451 steps to 23. A host bound that can only be enforced by destroying
+    # the answer costs more than the starvation it prevents.
+    "PLEX_DEMOTION_LIMIT": lambda: int(os.getenv("PLEX_DEMOTION_LIMIT", "0")),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages

@@ -397,6 +397,10 @@ class Scheduler(SchedulerInterface):
             "pause_refused_bound": 0,
             "pause_unknown_request": 0,
             "pause_not_running": 0,
+            # The most times any one request lost its seat. With the host bound
+            # off this is the only evidence that a policy is not starving one,
+            # so it is measured rather than assumed.
+            "max_request_preemptions": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -1431,6 +1435,9 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        self._plex_choice["max_request_preemptions"] = max(
+            self._plex_choice["max_request_preemptions"], request.num_preemptions
+        )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
