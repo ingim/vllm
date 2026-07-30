@@ -717,9 +717,18 @@ class VllmEnginePort:
         self._plex_ask_calls += 1
         self._plex_wanted_sum += wanted
         self._plex_offered_sum += len(residents)
+        # Amendment 5: `fixed_bytes` MUST include bytes held by objects that are
+        # not offered in `resident[]`. It was 0, so the retained-bytes equation
+        # was evaluated against a fiction -- and the objects it omits are real
+        # and numerous: preempted requests keep cached blocks in the census and
+        # `residents()` never offers them, and anything past the working-set
+        # truncation is in the same position. Priced in the same reclaim unit as
+        # `max_bytes` so the two are commensurable.
+        offered = {resident.engine_id for resident in residents}
+        unoffered = sum(1 for owner in census if owner not in offered)
         return CacheCapacity(
             max_bytes=max(unit * len(residents) - unit * wanted, 0),
-            fixed_bytes=0,
+            fixed_bytes=unit * unoffered,
             facts={"virtual_request_pressure": True},
         )
 

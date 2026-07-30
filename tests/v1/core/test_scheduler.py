@@ -518,6 +518,32 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+def test_plex_fixed_bytes_accounts_for_residency_it_cannot_offer():
+    """Amendment 5: bytes held by objects not in `resident[]` MUST be counted.
+
+    `fixed_bytes` was 0, so the retained-bytes equation was evaluated against a
+    fiction -- and the objects it omitted are real and numerous. A preempted
+    request keeps cached blocks in the census and `residents()` never offers it,
+    and anything past the working-set truncation is in the same position.
+    """
+    from vllm.v1.core.sched.async_plex import VllmEnginePort, reclaim_unit
+
+    scheduler = create_scheduler(num_blocks=64, block_size=16)
+    port = VllmEnginePort(scheduler)
+    scheduler.kv_cache_manager.block_pool.plex_cached_owners = lambda: {
+        f"owner-{i}": 2 for i in range(5)
+    }
+
+    class Resident:
+        def __init__(self, name: str) -> None:
+            self.engine_id = name
+
+    capacity = port.cache_capacity([Resident("owner-0"), Resident("owner-1")])
+
+    # Three of the five census owners were never offered.
+    assert capacity.fixed_bytes == 3 * reclaim_unit(scheduler)
+
+
 @pytest.mark.parametrize(
     "residents,census", [(1, 1), (1, 5), (2, 2), (5, 5), (5, 20)]
 )
@@ -542,7 +568,13 @@ def test_plex_cache_budget_always_leaves_headroom(residents, census):
         f"owner-{i}": 2 for i in range(census)
     }
 
-    capacity = port.cache_capacity([object()] * residents)
+    class Resident:
+        def __init__(self, name: str) -> None:
+            self.engine_id = name
+
+    capacity = port.cache_capacity(
+        [Resident(f"owner-{i}") for i in range(residents)]
+    )
 
     assert capacity.max_bytes >= reclaim_unit(scheduler)
 

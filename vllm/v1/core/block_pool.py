@@ -1039,6 +1039,17 @@ class BlockPool:
         for block in self.blocks:
             block.reset_hash()
 
+        # The PLEX ownership map has to go with them. Every block just lost its
+        # hash, so nothing can hit any of it -- but the map still named owners,
+        # so `plex_cached_owners` kept reporting a census of residents holding
+        # nothing, `cached_resident_ids` kept those requests resolvable, and the
+        # policy was offered phantom objects with non-zero `actual_size_bytes`
+        # to rank. A benchmark harness that resets between runs carried the
+        # previous run's residents into the next one's decisions.
+        self._plex_cached_owner.clear()
+        self._plex_owner_blocks.clear()
+        self._plex_owner_hit_ms.clear()
+
         if self.metrics_collector:
             self.metrics_collector.reset()
 

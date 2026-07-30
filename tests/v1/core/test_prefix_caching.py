@@ -4424,6 +4424,29 @@ def test_plex_spends_a_ranked_owner_from_the_tail_like_lru_does():
     assert sorted(pool._plex_owner_blocks["A"]) == chain[:-1]
 
 
+def test_plex_reset_prefix_cache_clears_the_ownership_map():
+    """A reset must not leave residents holding nothing behind.
+
+    `reset_prefix_cache` drops every block hash, so nothing can hit any of it --
+    but the PLEX ownership map survived, so the census kept reporting residents,
+    `cached_resident_ids` kept them resolvable, and the policy was offered
+    phantom objects with non-zero `actual_size_bytes` to rank. A harness that
+    resets between runs carried one run's residents into the next one's
+    decisions.
+    """
+    pool = _plex_pool(5)
+    order: list[str] = []
+    pool.set_plex_eviction_order(lambda: list(order))
+    blocks = _plex_seed(pool, "A", 4)
+    pool.free_blocks(pool.blocks[blocks[0] : blocks[-1] + 1], owner="A")
+    assert pool.plex_cached_owners() == {"A": 4}
+
+    assert pool.reset_prefix_cache()
+
+    assert pool.plex_cached_owners() == {}
+    assert pool.plex_cached_owners() == dict(pool.plex_cached_owners())
+
+
 def test_plex_reports_which_owners_the_ranking_evicted():
     """Prefix eviction has to be reportable, or the channel runs open-loop.
 
