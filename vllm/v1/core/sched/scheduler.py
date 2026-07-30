@@ -384,6 +384,9 @@ class Scheduler(SchedulerInterface):
             "waiting_seen_sum": 0,
             "waiting_ranked_sum": 0,
             "waiting_none_runnable": 0,
+            # Admissions the plan carried no decision about, where the request
+            # admitted was still not the one the engine would have chosen.
+            "unseen_diverged": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -996,6 +999,12 @@ class Scheduler(SchedulerInterface):
                     if plex_plan is not None:
                         plex_budget = plex_plan.token_budget(request_id)
                         if plex_budget is not None:
+                            # Counted on both paths. Only the running loop
+                            # counted before, so a run whose clamps all landed
+                            # on admissions read `tokens_clamped: 0` and looked
+                            # like a budget channel nothing had asked of.
+                            if plex_budget < num_new_tokens:
+                                self._plex_choice["tokens_clamped"] += 1
                             num_new_tokens = min(num_new_tokens, plex_budget)
                     assert num_new_tokens > 0
 
@@ -2168,6 +2177,19 @@ class Scheduler(SchedulerInterface):
         # decision, so admitting it natively is not overriding the policy --
         # whereas refusing to admit anything would starve every arrival that
         # landed after the plan was submitted.
+        #
+        # It is not, however, the *same* admission the engine would have made.
+        # Native FCFS drains `skipped_waiting` first, deliberately, so that
+        # requests an earlier pass skipped are not starved; this scan reaches
+        # `self.waiting` first and returns whatever it finds there. So the mere
+        # existence of a live plan can change which request is admitted while
+        # carrying no policy decision at all, and that divergence used to be
+        # counted nowhere -- which made every "the policy influenced nothing"
+        # reading of these counters too generous.
+        if unseen is not None:
+            native = self._select_waiting_queue_for_scheduling()
+            if native is not None and native.peek_request() is not unseen[1]:
+                self._plex_choice["unseen_diverged"] += 1
         return unseen
 
     @staticmethod
