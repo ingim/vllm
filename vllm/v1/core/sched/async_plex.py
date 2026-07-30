@@ -68,6 +68,7 @@ class VllmRequest:
         "_signals",
         "_cached_blocks",
         "_attained_service",
+        "_child_count",
     )
 
     def __init__(
@@ -77,6 +78,7 @@ class VllmRequest:
         signals: RequestSignals | None = None,
         cached_blocks: int | None = None,
         attained_service: int | None = None,
+        child_count: int = 0,
     ) -> None:
         self._request = request
         self._scheduler = scheduler
@@ -89,10 +91,23 @@ class VllmRequest:
         # at 4,000 tokens as the least-served candidate in the queue. The caller
         # passes what the request had accrued at the moment of the transition.
         self._attained_service = attained_service
+        # How many other requests are sitting on, or would hit, this resident's
+        # blocks. Preble's eviction key is
+        # `(replicated, interior, last_access_ms, index)` with
+        # `interior = child_count > 0`, so leaving it unpublished collapsed the
+        # key to recency alone -- the LRU baseline the policy is measured
+        # against. vLLM keeps no prefix tree, but the sharing set the port
+        # already computes for `beneficiaries` is the same relationship: an
+        # entry with dependents is exactly an interior node.
+        self._child_count = child_count
 
     @property
     def engine_id(self) -> str:
         return self._request.request_id
+
+    def set_child_count(self, count: int) -> None:
+        """Set after construction: sharing is a property of the whole set."""
+        self._child_count = count
 
     def plex_config(self) -> dict[str, Any] | None:
         params = self._request.sampling_params
@@ -175,7 +190,8 @@ class VllmRequest:
         request = self._request
         return {
             "actual_size_bytes": self.actual_size_bytes(),
-            "leaf": True,
+            "leaf": self._child_count == 0,
+            "child_count": self._child_count,
             "cached_length": request.num_computed_tokens,
             "computation_length": (
                 request.num_prompt_tokens + len(request.output_token_ids)
@@ -599,6 +615,13 @@ class VllmEnginePort:
                 )
             )
         residents.extend(self.view(request) for request in scheduler.running)
+        # One pass over the whole set: sharing is only visible when every
+        # resident is considered together, so this cannot be computed per view.
+        sharing = shared_beneficiaries(
+            scheduler, [resident.engine_id for resident in residents]
+        )
+        for resident in residents:
+            resident.set_child_count(len(sharing.get(resident.engine_id, ())))
         return residents
 
     def capacity(self) -> ScheduleCapacity:

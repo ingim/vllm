@@ -518,6 +518,39 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+def test_plex_publishes_child_count_so_interior_nodes_are_distinguishable():
+    """`leaf` was hardcoded true, so Preble's eviction key collapsed to LRU.
+
+    Preble ranks by `(replicated, interior, last_access_ms, index)` with
+    `interior = child_count > 0`. With the fact unpublished the second term was
+    always 0 and the key became recency alone -- which is the LRU baseline the
+    policy is measured against on `prefix_hit_rate`. vLLM keeps no prefix tree,
+    but the sharing set the port already computes for `beneficiaries` is the
+    same relationship: an entry with dependents is an interior node.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, block_size=16, num_blocks=256
+    )
+    attach_plex(scheduler, runtime)
+    first, second = create_requests(
+        num_requests=2, num_tokens=64, same_prompt=True, max_tokens=4
+    )
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+    scheduler.add_request(second)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    facts = [resident.cache_facts() for resident in scheduler.plex.port.residents()]
+
+    assert facts, "the fixture produced no residents"
+    # They share a prompt, so each depends on the other's blocks.
+    assert all(entry["child_count"] > 0 for entry in facts), facts
+    assert all(entry["leaf"] is False for entry in facts), facts
+
+
 def test_plex_fixed_bytes_accounts_for_residency_it_cannot_offer():
     """Amendment 5: bytes held by objects not in `resident[]` MUST be counted.
 
