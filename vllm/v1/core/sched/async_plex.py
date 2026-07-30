@@ -527,6 +527,17 @@ class VllmEnginePort:
             stats[f"sched_{key}"] = value
         return stats
 
+    def take_prefix_evictions(self) -> dict[str, int]:
+        """Owners the ranking evicted since the last call, for feedback.
+
+        The preemption seam reports through `mark_cache_enacted`; prefix
+        eviction had no equivalent, so the channel that does essentially all of
+        the cache work told the policy nothing about whether the object it
+        ranked was actually reclaimed.
+        """
+        pool = self.scheduler.kv_cache_manager.block_pool
+        return pool.take_plex_evicted_owners()
+
     def residents(self) -> list[VllmRequest]:
         """What the policy may reclaim, cached prefixes first.
 

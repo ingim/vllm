@@ -4424,6 +4424,32 @@ def test_plex_spends_a_ranked_owner_from_the_tail_like_lru_does():
     assert sorted(pool._plex_owner_blocks["A"]) == chain[:-1]
 
 
+def test_plex_reports_which_owners_the_ranking_evicted():
+    """Prefix eviction has to be reportable, or the channel runs open-loop.
+
+    `mark_cache_enacted` covers the preemption seam only, and preemption is the
+    rare half. In a measured run 7,308 policy-decided prefix evictions produced
+    zero feedback records, so a policy could never learn whether the object it
+    ranked was actually reclaimed.
+    """
+    pool = _plex_pool(5)
+    order: list[str] = []
+    pool.set_plex_eviction_order(lambda: list(order))
+    first = _plex_seed(pool, "A", 2)
+    second = _plex_seed(pool, "B", 2)
+    pool.free_blocks(pool.blocks[first[0] : first[-1] + 1], owner="A")
+    pool.free_blocks(pool.blocks[second[0] : second[-1] + 1], owner="B")
+
+    order[:] = ["B"]
+    pool.get_new_blocks(2)
+
+    evicted = pool.take_plex_evicted_owners()
+    assert evicted == {"B": 2}, evicted
+    # Draining is destructive: the next publish must not re-report the same
+    # eviction.
+    assert pool.take_plex_evicted_owners() == {}
+
+
 def test_plex_counts_evictions_taken_with_no_ranking_live():
     """An eviction the policy had no answer for belongs to neither counter.
 

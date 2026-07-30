@@ -247,6 +247,12 @@ class BlockPool:
         #: `last_access_ms`, which otherwise only advanced while the request was
         #: itself running.
         self._plex_owner_hit_ms: dict[str, int] = {}
+        #: Blocks taken from each owner because the policy ranked it, since the
+        #: last drain. Prefix eviction is the cache channel's dominant decision
+        #: and it reported nothing back, so a policy with a learning or retry
+        #: term ran open-loop: 7,308 policy-decided evictions produced zero
+        #: feedback records in a measured run.
+        self._plex_evicted_owners: dict[str, int] = {}
         #: Coverage of the ranking itself, which is what decides the split
         #: above. `_cache_order` holds only the residents the policy *named*,
         #: and the ask names exactly as many as `max_bytes` forces it to, so a
@@ -817,6 +823,9 @@ class BlockPool:
                     self._plex_evict_diverged += 1
                 self.free_block_queue.remove(block)
                 self._plex_drop(block.block_id)
+                self._plex_evicted_owners[owner] = (
+                    self._plex_evicted_owners.get(owner, 0) + 1
+                )
                 taken.add(block.block_id)
                 ret.append(block)
         self._plex_evicted_ranked += len(ret) - free_first
@@ -882,6 +891,12 @@ class BlockPool:
             owner: len(blocks)
             for owner, blocks in self._plex_owner_blocks.items()
         }
+
+    def take_plex_evicted_owners(self) -> dict[str, int]:
+        """Owners whose blocks the ranking spent, and how many, since last call."""
+        drained = self._plex_evicted_owners
+        self._plex_evicted_owners = {}
+        return drained
 
     def plex_owner_last_hit_ms(self, owner: str) -> int | None:
         """When this owner's cached prefix was last hit, if ever."""
