@@ -518,6 +518,53 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+def test_plex_preemption_walks_past_a_victim_that_is_not_running():
+    """The head of a worst-first ranking is routinely un-preemptable.
+
+    `residents()` publishes parked, finished-but-cached requests ahead of running
+    ones, so the first entry of the policy's reclaim order often names a request
+    that is not in `self.running` at all. Stopping at that first miss meant an
+    18-entry ranking spent 18 allocation failures on native preemptions and left
+    `cache_enacted` at 0 for whole runs.
+    """
+    from plex.engine.outcomes import CacheDecision
+
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(num_blocks=11, block_size=16, max_num_seqs=4)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=80, max_tokens=8)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    def decision(request_id: str, index: int) -> CacheDecision:
+        return CacheDecision(
+            opportunity_id="op",
+            submitted_at=0.0,
+            object_id=request_id,
+            request_id=request_id,
+            object_index=index,
+        )
+
+    # A parked resident first -- nothing the engine can preempt -- then a real
+    # running request.
+    answers = [decision("parked-and-finished", 0), decision(requests[0].request_id, 1)]
+    reported: list[tuple[str, bool]] = []
+    scheduler.plex.cached_preemption = lambda: answers.pop(0) if answers else None
+    scheduler.plex.mark_cache_enacted = lambda d, r: reported.append(
+        (d.request_id, r is not None)
+    )
+
+    scheduler.schedule()  # KV is exhausted here, so a preemption happens
+
+    assert requests[0].status == RequestStatus.PREEMPTED
+    assert reported == [
+        ("parked-and-finished", False),
+        (requests[0].request_id, True),
+    ], reported
+
+
 def test_plex_async_cache_decision_is_one_shot_and_reported():
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler()

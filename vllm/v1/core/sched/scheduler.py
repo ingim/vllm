@@ -666,26 +666,34 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    cache_decision = (
-                        self.plex.cached_preemption() if self.plex is not None else None
-                    )
-                    victim_id = (
-                        cache_decision.request_id
-                        if cache_decision is not None
-                        else None
-                    )
-                    preempted_req = (
-                        next(
-                            (
-                                candidate
-                                for candidate in self.running
-                                if candidate.request_id == victim_id
-                            ),
-                            None,
-                        )
-                        if victim_id is not None
-                        else None
-                    )
+                    # Walk the policy's ranking until it names something this
+                    # engine can actually preempt. `residents()` publishes
+                    # parked, finished-but-cached requests ahead of running
+                    # ones, so the head of a worst-first list is routinely a
+                    # request that is not in `self.running` at all -- and
+                    # stopping at the first miss meant an 18-entry ranking spent
+                    # 18 allocation failures on native preemptions and left
+                    # `cache_enacted` at 0 for whole runs. Each entry that
+                    # cannot be acted on is still reported as not-enacted, so
+                    # the policy learns its ranking was unusable rather than
+                    # silently ignored.
+                    cache_decision = None
+                    preempted_req = None
+                    if self.plex is not None:
+                        running_by_id = {
+                            candidate.request_id: candidate
+                            for candidate in self.running
+                        }
+                        while True:
+                            cache_decision = self.plex.cached_preemption()
+                            if cache_decision is None:
+                                break
+                            preempted_req = running_by_id.get(
+                                cache_decision.request_id
+                            )
+                            if preempted_req is not None:
+                                break
+                            self.plex.mark_cache_enacted(cache_decision, None)
                     if preempted_req is not None:
                         self.running.remove(preempted_req)
                     elif self.policy == SchedulingPolicy.PRIORITY:
