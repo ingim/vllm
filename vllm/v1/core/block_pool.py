@@ -225,6 +225,17 @@ class BlockPool:
         #: exists to remove, and it applies to the fix as much as to the bug.
         self._plex_evicted_ranked = 0
         self._plex_evicted_lru = 0
+        #: Coverage of the ranking itself, which is what decides the split
+        #: above. `_cache_order` holds only the residents the policy *named*,
+        #: and the ask names exactly as many as `max_bytes` forces it to, so a
+        #: short ranking hands the remainder of every allocation back to LRU.
+        #: Recording the ranking against the census it was drawn from is the
+        #: only way to tell a starved budget from a policy that ranks few by
+        #: design -- the two produce the same LRU share and need opposite fixes.
+        self._plex_rank_calls = 0
+        self._plex_rank_len_sum = 0
+        self._plex_census_len_sum = 0
+        self._plex_rank_exhausted = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -746,6 +757,9 @@ class BlockPool:
         if len(ret) >= num_blocks:
             return ret
         taken: set[int] = set()
+        self._plex_rank_calls += 1
+        self._plex_rank_len_sum += len(ranked)
+        self._plex_census_len_sum += len(self._plex_owner_blocks)
         for owner in ranked:
             if len(ret) >= num_blocks:
                 break
@@ -765,6 +779,7 @@ class BlockPool:
                 ret.append(block)
         self._plex_evicted_ranked += len(ret) - free_first
         if len(ret) < num_blocks:
+            self._plex_rank_exhausted += 1
             tail = self.free_block_queue.popleft_n(num_blocks - len(ret))
             # Only a block that cached something was an eviction the policy
             # could have owned and did not. An empty page is nobody's loss.
@@ -779,6 +794,10 @@ class BlockPool:
         return {
             "prefix_evicted_by_policy": self._plex_evicted_ranked,
             "prefix_evicted_by_lru": self._plex_evicted_lru,
+            "rank_calls": self._plex_rank_calls,
+            "rank_len_sum": self._plex_rank_len_sum,
+            "rank_census_sum": self._plex_census_len_sum,
+            "rank_exhausted": self._plex_rank_exhausted,
         }
 
     def _plex_own(self, block_id: int, owner: str) -> None:

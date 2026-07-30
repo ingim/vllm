@@ -384,6 +384,14 @@ class VllmEnginePort:
         # Evictions charged at the previous `cache_capacity`; the difference is
         # what the engine consumed while the last plan was in force.
         self._plex_last_evicted = 0
+        # How many residents each ask told the policy to give up, against how
+        # many it was offered. The ranking the engine later walks is exactly
+        # the set the policy named, and it names only as many as `max_bytes`
+        # forces, so this pair is what separates a starved budget from a policy
+        # that ranks few of its own accord.
+        self._plex_ask_calls = 0
+        self._plex_wanted_sum = 0
+        self._plex_offered_sum = 0
 
     def observe(self, request: Request) -> RequestSignals:
         """Record what only arrival order and the cache-at-arrival can say."""
@@ -460,7 +468,13 @@ class VllmEnginePort:
         let eight prefix-caching replications be measured against a decision
         they never made.
         """
-        return self.scheduler.kv_cache_manager.block_pool.plex_eviction_stats()
+        stats = dict(
+            self.scheduler.kv_cache_manager.block_pool.plex_eviction_stats()
+        )
+        stats["ask_calls"] = self._plex_ask_calls
+        stats["ask_wanted_sum"] = self._plex_wanted_sum
+        stats["ask_offered_sum"] = self._plex_offered_sum
+        return stats
 
     def residents(self) -> list[VllmRequest]:
         """What the policy may reclaim, cached prefixes first.
@@ -554,7 +568,32 @@ class VllmEnginePort:
         if cached_blocks and census:
             mean = max(cached_blocks // len(census), 1)
             wanted = -(-(deficit + taken) // mean)
-        wanted = max(1, min(wanted, len(census) or 1, max(len(residents), 1)))
+        # Sizing the ask in bytes is still not enough, because the *answer* is
+        # a list of requests and the engine spends it at allocation granularity.
+        # Measured on ShareGPT: 119 residents offered per ask, 7.8 demanded, and
+        # the ranking `_plex_take` actually held averaged 3.5 of an 85-request
+        # census -- against 158 allocations per ask. Those 3.5 owners are drained
+        # in the first few allocations and the remaining 96% fall through to LRU.
+        # A budget that is correct in bytes for the interval is therefore still
+        # wrong in *entries* for the interval, so the demand asks the policy to
+        # order the whole cached census: enough order to survive the gap between
+        # asks. Measured, Preble's share of prefix evictions went 12.8% -> 34.5%
+        # at half the census and the policy named exactly what it was asked with
+        # no plan refused, which is what says the ranking was budget-limited
+        # rather than policy-limited.
+        #
+        # One resident of headroom is always left. `max_bytes` is the only lever
+        # the contract gives, so demanding the entire residency sets the budget
+        # to zero, and a plan that retains anything at all is then over budget
+        # and refused *whole* -- the S6.24 class, which turns a starved channel
+        # into a dead one. Over-naming otherwise costs nothing: `_plex_take`
+        # walks the order and takes only the blocks it needs, so a longer
+        # ranking evicts no more, it just keeps deciding for longer.
+        wanted = max(wanted, len(census))
+        wanted = max(1, min(wanted, len(census) or 1, max(len(residents) - 1, 1)))
+        self._plex_ask_calls += 1
+        self._plex_wanted_sum += wanted
+        self._plex_offered_sum += len(residents)
         return CacheCapacity(
             max_bytes=max(unit * len(residents) - unit * wanted, 0),
             fixed_bytes=0,
