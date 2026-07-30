@@ -2297,6 +2297,54 @@ def test_spec_decode_padding_first_decode_step():
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
 
 
+def test_plex_preemption_reports_host_initiator_and_the_service_it_lost():
+    """A preemption record has to say who did it, and what it cost.
+
+    `docs/plex_0.7.md` makes `initiator` a MUST -- a policy auditing whether a
+    pause was its own doing cannot tell otherwise, and `policies/coordinated`
+    counts `host_preemptions` off exactly that key. It was never set, so the
+    counter read 0 for the life of every run while vLLM preempted freely.
+
+    And the record is built after `num_computed_tokens` is zeroed, so it used to
+    say the request had been served nothing at the moment it lost its work. A
+    fair-share policy reading that as cumulative service re-ranks a request
+    preempted at 80 tokens as the least-served candidate in the queue.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(num_blocks=11, block_size=16, max_num_seqs=4)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=80, max_tokens=8)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+    assert all(request.num_computed_tokens == 80 for request in requests)
+
+    scheduler.schedule()  # KV is exhausted here, so one request is preempted
+    scheduler.publish_plex()
+
+    def records(node):
+        if isinstance(node, dict):
+            if "initiator" in (node.get("facts") or {}):
+                yield node["facts"]
+            for value in node.values():
+                yield from records(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from records(value)
+
+    preemptions = [
+        facts
+        for channel, _epoch, event in runtime.submissions
+        if channel == "feedback"
+        for facts in records(event)
+        if facts.get("preempted")
+    ]
+    assert preemptions, "no preemption was reported to the policy at all"
+    assert all(facts["initiator"] == "host" for facts in preemptions)
+    assert all(facts["attained_service"] == 80 for facts in preemptions)
+
+
 def _plex_preemption_victim(rank_only: bool):
     """Two requests filling KV exactly; the next token forces a preemption.
 

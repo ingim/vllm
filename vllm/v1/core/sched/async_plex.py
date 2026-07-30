@@ -62,7 +62,13 @@ PlexCacheDecision = CacheDecision
 class VllmRequest:
     """One `Request`, answering the questions `plex.engine` asks."""
 
-    __slots__ = ("_request", "_scheduler", "_signals", "_cached_blocks")
+    __slots__ = (
+        "_request",
+        "_scheduler",
+        "_signals",
+        "_cached_blocks",
+        "_attained_service",
+    )
 
     def __init__(
         self,
@@ -70,11 +76,19 @@ class VllmRequest:
         scheduler: Scheduler,
         signals: RequestSignals | None = None,
         cached_blocks: int | None = None,
+        attained_service: int | None = None,
     ) -> None:
         self._request = request
         self._scheduler = scheduler
         self._signals = signals if signals is not None else NO_SIGNALS
         self._cached_blocks = cached_blocks
+        # Preemption zeroes `num_computed_tokens` before the port is told, so a
+        # record built afterwards reports that the request has been served
+        # nothing. The engine is right -- it threw the work away -- but a policy
+        # reading this as cumulative service then re-ranks a request preempted
+        # at 4,000 tokens as the least-served candidate in the queue. The caller
+        # passes what the request had accrued at the moment of the transition.
+        self._attained_service = attained_service
 
     @property
     def engine_id(self) -> str:
@@ -99,14 +113,19 @@ class VllmRequest:
         signals = self._signals
         waiting_ms = max(int((time.time() - request.arrival_time) * 1000), 0)
         running = request.status == RequestStatus.RUNNING
+        served = (
+            request.num_computed_tokens
+            if self._attained_service is None
+            else self._attained_service
+        )
         prompt_tokens = request.num_prompt_tokens
         hit = min(signals.lpm_hit_tokens, prompt_tokens)
         uncached = prompt_tokens - hit
         return {
             "queue_member": not running,
             "scheduler_state": "running" if running else "waiting",
-            "attained_service": request.num_computed_tokens,
-            "service_tokens": request.num_computed_tokens,
+            "attained_service": served,
+            "service_tokens": served,
             "dispatch_input_tokens": max(
                 prompt_tokens - request.num_computed_tokens, 0
             ),
@@ -446,9 +465,14 @@ class VllmEnginePort:
         """
         self._parked[request.request_id] = request
 
-    def view(self, request: Request) -> VllmRequest:
+    def view(
+        self, request: Request, attained_service: int | None = None
+    ) -> VllmRequest:
         return VllmRequest(
-            request, self.scheduler, self._signals.get(request.request_id)
+            request,
+            self.scheduler,
+            self._signals.get(request.request_id),
+            attained_service=attained_service,
         )
 
     def candidates(self) -> list[VllmRequest]:
@@ -912,8 +936,12 @@ class AsyncPlexPolicyController:
             output_tokens=output_tokens,
         )
 
-    def mark_preempted(self, request: Request) -> None:
-        self.controller.mark_preempted(self.port.view(request))
+    def mark_preempted(
+        self, request: Request, attained_service: int | None = None
+    ) -> None:
+        self.controller.mark_preempted(
+            self.port.view(request, attained_service=attained_service)
+        )
 
     def mark_finished(self, request: Request, reason: str) -> None:
         self.controller.mark_finished(self.port.view(request), reason)

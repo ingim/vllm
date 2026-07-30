@@ -1395,6 +1395,12 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
+        # Captured before the reset: the policy is told about the transition
+        # after `num_computed_tokens` has been zeroed, so the record otherwise
+        # says the request had been served nothing at the moment it lost its
+        # work -- and a fair-share policy re-ranks it as the least-served
+        # candidate in the queue.
+        attained_service = request.num_computed_tokens
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
@@ -1406,7 +1412,7 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
         if self.plex is not None:
-            self.plex.mark_preempted(request)
+            self.plex.mark_preempted(request, attained_service=attained_service)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
