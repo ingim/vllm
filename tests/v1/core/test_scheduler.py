@@ -518,6 +518,49 @@ def test_plex_async_allows_policy_private_request_fields():
     assert output.num_scheduled_tokens == {requests[1].request_id: 10}
 
 
+def test_plex_prices_a_queued_cache_hitter_at_what_is_left_to_do():
+    """A waiting request costs what the cache does not already hold.
+
+    `token_budget` counted the whole prompt while `dispatch_input_tokens` and
+    `new_prefill_tokens` in the same fact set subtracted the hit, so the policy
+    got two answers to one question -- and the one it packs a step against was
+    the wrong one, over-pricing exactly the arrival a cache-aware policy wants
+    to admit first.
+
+    The floor matters as much as the subtraction. A fully cached arrival must
+    still price above zero, because the controller submits only candidates with
+    a positive budget: pricing it at zero would drop it out of the set the
+    policy is allowed to rank at all. One token is vLLM's own answer -- on a
+    full prompt hit it re-computes the last token.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(
+        enable_prefix_caching=True, block_size=16, num_blocks=256
+    )
+    attach_plex(scheduler, runtime)
+    first, second = create_requests(
+        num_requests=2, num_tokens=64, same_prompt=True, max_tokens=4
+    )
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    # `second` shares the whole prompt, so most of it is already resident.
+    scheduler.add_request(second)
+    view = scheduler.plex.port.view(second)
+    facts = view.facts()
+
+    assert facts["lpm_hit_tokens"] > 0, "the fixture must produce a cache hit"
+    budget = view.token_budget()
+    assert 0 < budget <= second.num_tokens - facts["lpm_hit_tokens"] + 1, (
+        budget,
+        facts["lpm_hit_tokens"],
+        second.num_tokens,
+    )
+    # The two facts that answer the same question now agree in direction.
+    assert budget <= facts["dispatch_input_tokens"] + 1
+
+
 def test_plex_publishes_child_count_so_interior_nodes_are_distinguishable():
     """`leaf` was hardcoded true, so Preble's eviction key collapsed to LRU.
 

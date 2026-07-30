@@ -226,13 +226,31 @@ class VllmRequest:
     def token_budget(self) -> int:
         request = self._request
         scheduler = self._scheduler
-        pending = (
-            request.num_tokens_with_spec
-            + request.num_output_placeholders
-            - request.num_computed_tokens
-            if request.status == RequestStatus.RUNNING
-            else request.num_tokens - request.num_computed_tokens
-        )
+        if request.status == RequestStatus.RUNNING:
+            pending = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+        else:
+            # A waiting request costs what the cache does not already hold. This
+            # counted the whole prompt, so a queued cache-hitter was priced at
+            # full cost while `dispatch_input_tokens` and `new_prefill_tokens`
+            # in the same fact set already subtracted the hit -- the policy was
+            # given two different answers to one question and the one it packs a
+            # step against was the wrong one.
+            #
+            # Floored at 1, which is vLLM's own rule rather than a guard invented
+            # here: on a full prompt hit the scheduler re-computes the last token
+            # (`num_computed_tokens = num_tokens - 1`). Without the floor a fully
+            # cached arrival would price at zero, and the controller submits only
+            # candidates with a positive budget -- so the request the policy most
+            # wants to admit would vanish from the set it is allowed to rank.
+            already = max(
+                request.num_computed_tokens,
+                min(self._signals.lpm_hit_tokens, request.num_prompt_tokens),
+            )
+            pending = max(request.num_tokens - already, 1)
         return max(
             min(
                 pending,
