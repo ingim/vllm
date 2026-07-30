@@ -4391,6 +4391,39 @@ def test_plex_spends_free_blocks_before_the_ranking():
     assert pool.plex_cached_owners() == {"A": 2, "B": 2}
 
 
+def test_plex_spends_a_ranked_owner_from_the_tail_like_lru_does():
+    """Which block of the chain, not just which owner, decides what survives.
+
+    vLLM frees a request's blocks with `reversed(blocks)`, so the tail sits
+    nearest the free queue's head and the surviving prefix stays hittable --
+    `find_longest_cache_hit` stops at the first miss, so evicting from the front
+    of a chain makes every later block unreachable while it is still resident.
+
+    The ranking used to be spent in `set` iteration order, which for contiguous
+    block ids is ascending, i.e. prefix-first. Freeing one page then cost the
+    whole chain's reachability and the counters recorded a single eviction.
+    """
+    # Exactly the seeded blocks: an empty page is spent before the ranking, so
+    # a spare would be taken first and the eviction path never reached.
+    pool = _plex_pool(5)
+    order: list[str] = []
+    pool.set_plex_eviction_order(lambda: list(order))
+    chain = _plex_seed(pool, "A", 4)
+    # Freed the way the engine frees: tail first.
+    pool.free_blocks(
+        [pool.blocks[block_id] for block_id in reversed(chain)], owner="A"
+    )
+    assert pool.plex_cached_owners() == {"A": 4}
+
+    order[:] = ["A"]
+    taken = [block.block_id for block in pool.get_new_blocks(1)]
+
+    # The tail block, which is what LRU would have taken, and what leaves the
+    # rest of the prefix reachable.
+    assert taken == [chain[-1]], (taken, chain)
+    assert sorted(pool._plex_owner_blocks["A"]) == chain[:-1]
+
+
 def test_plex_counts_evictions_taken_with_no_ranking_live():
     """An eviction the policy had no answer for belongs to neither counter.
 

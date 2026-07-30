@@ -216,7 +216,16 @@ class BlockPool:
         #: Reverse index of the same mapping. Kept incrementally because
         #: `_plex_take` runs per allocation and rebuilding owner -> blocks from
         #: scratch there would cost O(cached blocks) on the hot path.
-        self._plex_owner_blocks: dict[str, set[int]] = {}
+        # Insertion-ordered, and the order is load-bearing. `free_blocks`
+        # receives a request's blocks tail-first -- vLLM frees with
+        # `reversed(blocks)` so the tail sits nearest the free queue's head and
+        # the surviving prefix stays hittable -- and ownership is recorded in
+        # that same pass. So iterating this in insertion order spends an
+        # owner's blocks in exactly the order LRU would have taken them. A set
+        # iterates in hash order, which for contiguous small ids is ascending,
+        # i.e. prefix-first: freeing one page then destroyed the whole chain's
+        # reachability while leaving it resident.
+        self._plex_owner_blocks: dict[str, dict[int, None]] = {}
         self._plex_eviction_order: Callable[[], Sequence[str]] | None = None
         #: Blocks taken because the policy ranked their owner, and blocks taken
         #: off the LRU tail after the ranking ran out. Without these the new
@@ -847,7 +856,7 @@ class BlockPool:
         if previous is not None:
             self._plex_drop(block_id)
         self._plex_cached_owner[block_id] = owner
-        self._plex_owner_blocks.setdefault(owner, set()).add(block_id)
+        self._plex_owner_blocks.setdefault(owner, {})[block_id] = None
 
     def _plex_drop(self, block_id: int) -> None:
         owner = self._plex_cached_owner.pop(block_id, None)
@@ -856,7 +865,7 @@ class BlockPool:
         blocks = self._plex_owner_blocks.get(owner)
         if blocks is None:
             return
-        blocks.discard(block_id)
+        blocks.pop(block_id, None)
         if not blocks:
             del self._plex_owner_blocks[owner]
 
