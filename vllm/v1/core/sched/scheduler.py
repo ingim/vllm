@@ -373,6 +373,17 @@ class Scheduler(SchedulerInterface):
             "running_reordered": 0,
             "running_deferred": 0,
             "tokens_clamped": 0,
+            # Why a waiting pick did or did not happen. `waiting_picks` alone
+            # cannot separate "the policy was never offered the queue" from
+            # "it was offered and declined" from "it ranked one and the seat
+            # was already gone".
+            "plan_live_steps": 0,
+            "plan_live_steps_with_queue": 0,
+            "waiting_calls": 0,
+            "waiting_scanned_sum": 0,
+            "waiting_seen_sum": 0,
+            "waiting_ranked_sum": 0,
+            "waiting_none_runnable": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -504,6 +515,13 @@ class Scheduler(SchedulerInterface):
             self._plex_choice["running_depth_sum"] += len(self.running)
             if queued:
                 self._plex_choice["steps_with_queue"] += 1
+            # Steps on which a plan existed at all. `fallback` counts refused
+            # answers, not absent ones, so it reads 0 on a run the engine
+            # scheduled natively because no plan happened to be live.
+            if plex_plan is not None:
+                self._plex_choice["plan_live_steps"] += 1
+                if queued:
+                    self._plex_choice["plan_live_steps_with_queue"] += 1
         if plex_plan is not None:
             before = [request.request_id for request in self.running]
             self.running.sort(
@@ -2123,13 +2141,23 @@ class Scheduler(SchedulerInterface):
 
         selected: tuple[int, RequestQueue, Request] | None = None
         unseen: tuple[RequestQueue, Request] | None = None
+        self._plex_choice["waiting_calls"] += 1
         for request_queue in (self.waiting, self.skipped_waiting):
             for request in request_queue:
                 rank = plex_plan.rank(request.request_id)
+                self._plex_choice["waiting_scanned_sum"] += 1
+                if plex_plan.saw(request.request_id):
+                    self._plex_choice["waiting_seen_sum"] += 1
+                if rank is not None:
+                    self._plex_choice["waiting_ranked_sum"] += 1
                 if rank is not None and (selected is None or rank < selected[0]):
                     selected = (rank, request_queue, request)
                 if unseen is None and not plex_plan.saw(request.request_id):
                     unseen = (request_queue, request)
+        if selected is None and unseen is None:
+            # Every queued request was in the plan and none was selected, so the
+            # waiting loop breaks and this step admits nobody.
+            self._plex_choice["waiting_none_runnable"] += 1
         if selected is not None:
             self._plex_choice["waiting_picks"] += 1
             native = self._select_waiting_queue_for_scheduling()
