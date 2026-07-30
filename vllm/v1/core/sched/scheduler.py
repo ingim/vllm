@@ -962,6 +962,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    unpadded_new_tokens = num_new_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1006,6 +1007,29 @@ class Scheduler(SchedulerInterface):
                             if plex_budget < num_new_tokens:
                                 self._plex_choice["tokens_clamped"] += 1
                             num_new_tokens = min(num_new_tokens, plex_budget)
+                            # The pad above reserves `1 + num_spec_tokens` and
+                            # commits to emitting that many draft placeholders.
+                            # Clamping the token count underneath it leaves the
+                            # two inconsistent, and the model runner derives
+                            # `logits_indices` from their difference -- so a
+                            # budget of 1 against a pad of 4 produced negative
+                            # indices and sampled the request's tokens from
+                            # another request's logits. Silently, with no
+                            # assertion anywhere on the path.
+                            #
+                            # Upstream's own rule when the padded size does not
+                            # fit is to not schedule it padded. Here the request
+                            # is already admitted, so the equivalent is to drop
+                            # the speculation and honour the budget: no drafts,
+                            # and the token count the request actually needs.
+                            if (
+                                pad_spec_decode
+                                and num_new_tokens < 1 + self.num_spec_tokens
+                            ):
+                                pad_spec_decode = False
+                                num_new_tokens = min(
+                                    num_new_tokens, unpadded_new_tokens
+                                )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.

@@ -2297,6 +2297,92 @@ def test_spec_decode_padding_first_decode_step():
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
 
 
+def test_plex_budget_below_the_spec_pad_drops_speculation_rather_than_desyncing():
+    """A clamped token count must never leave the draft placeholders behind.
+
+    The pad reserves `1 + num_spec_tokens` and commits to emitting that many
+    placeholder drafts. A PLEX budget below it used to clamp only the token
+    count, and the model runner derives `logits_indices` from the difference
+    between the two -- so 1 scheduled token against 3 drafts produced negative
+    indices and sampled this request's tokens from another request's logits,
+    silently and with no assertion on the path.
+
+    It is not a corner case: for a request with one token left, a budget of 1 is
+    the only value the contract allows, so any plan selecting it triggers this.
+    """
+    num_spec = 3
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    attach_plex(scheduler, runtime)
+    r1, r2 = create_requests(
+        num_requests=2, num_tokens=33, same_prompt=True, max_tokens=16
+    )
+
+    scheduler.add_request(r1)
+    out = scheduler.schedule()
+    _model_output(scheduler, out, [[100]])
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3]]))
+
+    # r2's whole prompt is a prefix-cache hit, so it takes a first decode step
+    # and is the request the pad applies to.
+    scheduler.add_request(r2)
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    event = next(
+        event
+        for channel, _epoch, event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    ids = [entry["request"]["request_id"] for entry in event["context"]["runnable"]]
+    index = {
+        request.request_id: next(
+            i for i, name in enumerate(ids) if name.endswith(request.request_id)
+        )
+        for request in (r1, r2)
+    }
+    # r1 has to stay scheduled. The pad only applies when the running set was
+    # served this step, so a plan that drops r1 disables the path under test and
+    # the assertions below pass without proving anything. One request per
+    # selection, because a selection naming two is refused and the whole plan
+    # with it -- which also silently removes the budget.
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [
+                        {"requests": [index[r1.request_id]], "token_budgets": [64]},
+                        {"requests": [index[r2.request_id]], "token_budgets": [1]},
+                    ]
+                },
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    plan = scheduler.plex.poll_schedule()
+    assert plan is not None and plan.token_budget(r2.request_id) == 1
+
+    out = scheduler.schedule()
+
+    scheduled = out.num_scheduled_tokens[r2.request_id]
+    drafts = out.scheduled_spec_decode_tokens.get(r2.request_id, [])
+    assert scheduled == 1, scheduled
+    # The invariant the model runner depends on: one sampled position per
+    # scheduled token, so no negative `logits_indices`.
+    assert len(drafts) == scheduled - 1 == 0, (scheduled, drafts)
+
+
 def test_spec_decode_padding_skipped_for_diffusion():
     """Diffusion spec tokens are the fixed-size denoising canvas, not
     rejectable drafts: a first-decode-step request must keep its 1-token span
