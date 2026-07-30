@@ -2297,6 +2297,83 @@ def test_spec_decode_padding_first_decode_step():
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
 
 
+def _plex_preemption_victim(rank_only: bool):
+    """Two requests filling KV exactly; the next token forces a preemption.
+
+    `rank_only=False` omits the first request from the plan entirely;
+    `rank_only=True` selects both but ranks the second ahead of it. Both are
+    supposed to leave the first request's KV alone.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(num_blocks=11, block_size=16, max_num_seqs=4)
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=80, max_tokens=8)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+
+    scheduler.publish_plex()
+    epoch = next(
+        epoch
+        for channel, epoch, _event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    event = next(
+        event
+        for channel, _epoch, event in reversed(runtime.submissions)
+        if channel == "schedule"
+    )
+    ids = [entry["request"]["request_id"] for entry in event["context"]["runnable"]]
+    index = {
+        request.request_id: next(
+            i for i, name in enumerate(ids) if name.endswith(request.request_id)
+        )
+        for request in requests
+    }
+    selections = [
+        {"requests": [index[requests[1].request_id]], "token_budgets": [8]}
+    ]
+    if rank_only:
+        selections.append(
+            {"requests": [index[requests[0].request_id]], "token_budgets": [8]}
+        )
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {"operation": "schedule", "plan": {"selections": selections}},
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    # Pin that the plan actually applied before asserting what it did.
+    plan = scheduler.plex.poll_schedule()
+    assert plan is not None
+    assert plan.selects(requests[1].request_id)
+    assert plan.selects(requests[0].request_id) is rank_only
+
+    scheduler.schedule()
+    return requests
+
+
+@pytest.mark.parametrize("rank_only", [False, True])
+def test_plex_omission_does_not_choose_the_preemption_victim(rank_only):
+    """Omission is not preemption, and rank is not an eviction order.
+
+    The plan sorts the persistent `self.running` list and vLLM's default victim
+    rule is that list's tail, so every request the plan omitted -- or merely
+    ranked last -- became the front of the eviction queue. `docs/plex_0.7.md`
+    forbids it outright: the host MUST NOT invalidate KV residency because of
+    omission alone. Measured before the fix, the omitted request was preempted
+    and its 80 computed tokens reset to 0.
+    """
+    first, second = _plex_preemption_victim(rank_only)
+    assert first.status == RequestStatus.RUNNING
+    assert first.num_computed_tokens == 80
+    assert second.status == RequestStatus.PREEMPTED
+
+
 def test_plex_budget_below_the_spec_pad_drops_speculation_rather_than_desyncing():
     """A clamped token count must never leave the draft placeholders behind.
 

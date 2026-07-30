@@ -525,8 +525,16 @@ class Scheduler(SchedulerInterface):
                 self._plex_choice["plan_live_steps"] += 1
                 if queued:
                     self._plex_choice["plan_live_steps_with_queue"] += 1
+        # The engine's own order, kept because the plan's order must not decide
+        # who gets preempted. `self.running` is the persistent list and vLLM's
+        # default victim rule is its tail, so sorting it by plan rank -- which
+        # puts every request the plan omitted last -- turned omission into the
+        # front of the eviction queue. The contract forbids exactly that: the
+        # host MUST NOT invalidate KV residency because of omission alone.
+        native_running_order: list[str] | None = None
         if plex_plan is not None:
             before = [request.request_id for request in self.running]
+            native_running_order = before
             self.running.sort(
                 key=lambda request: (
                     plex_plan.rank(request.request_id) is None,
@@ -687,7 +695,7 @@ class Scheduler(SchedulerInterface):
                         )
                         self.running.remove(preempted_req)
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = self._pop_native_victim(native_running_order)
 
                     if preempted_req in scheduled_running_reqs:
                         preempted_req_id = preempted_req.request_id
@@ -2150,6 +2158,30 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def _pop_native_victim(self, native_order: list[str] | None) -> Request:
+        """Remove and return the request vLLM itself would have preempted.
+
+        The default rule is "the tail of `self.running`", which is only the
+        engine's own choice while that list is in the engine's own order. A
+        schedule plan sorts it, so the tail becomes the request the policy ranked
+        worst or did not rank at all -- and a plan's ordering silently became an
+        eviction order. Preempting is `docs/plex_0.7.md`'s `request.pause@1`,
+        which this port deliberately does not negotiate; omission is not
+        preemption and must not act like it.
+
+        The cache channel's named victim is honoured before this is ever
+        reached; this is only the fallback, and the fallback has to be native.
+        """
+        if not native_order:
+            return self.running.pop()
+        position = {request_id: index for index, request_id in enumerate(native_order)}
+        victim = max(
+            self.running,
+            key=lambda request: position.get(request.request_id, len(position)),
+        )
+        self.running.remove(victim)
+        return victim
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
