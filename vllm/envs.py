@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
     PLEX_ADMISSION_CONTROL: bool = False
+    PLEX_SCHEDULE_RANK_WAITING: bool = False
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -821,6 +822,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # meaningful for a policy that implements `admit`; anything else pays
     # the admission deadline on every request and admits it anyway.
     "PLEX_ADMISSION_CONTROL": lambda: bool(int(os.getenv("PLEX_ADMISSION_CONTROL", "0"))),
+    # Let a schedule plan rank requests that are still waiting, by reporting a
+    # selection allowance larger than the running set. Off by default so the
+    # two states are measurable on one build; see
+    # `experiments/regime-preregistration.md` section 6.
+    "PLEX_SCHEDULE_RANK_WAITING": lambda: bool(
+        int(os.getenv("PLEX_SCHEDULE_RANK_WAITING", "0"))
+    ),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages

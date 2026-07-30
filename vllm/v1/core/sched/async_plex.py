@@ -23,6 +23,7 @@ from plex.engine import (
     RequestSignals,
     ScheduleCapacity,
     SchedulePlan,
+    events,
 )
 
 from vllm import envs
@@ -37,6 +38,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 DEFAULT_PRINCIPAL = "vllm-default"
+
+# The host refuses a working set wider than this, and the controller submits a
+# leading prefix of `candidates()` to stay inside it. Imported rather than
+# mirrored: a copy of a contract bound is exactly the kind of duplicate that
+# drifts a revision behind without anyone noticing.
+MAX_RANKABLE_CANDIDATES = events.MAX_WORKING_SET_REQUESTS
 
 # Requests parked on something other than capacity cannot be selected, so
 # offering them to the policy would ask it to rank what it cannot start.
@@ -520,10 +527,40 @@ class VllmEnginePort:
         return residents
 
     def capacity(self) -> ScheduleCapacity:
+        """How many candidates the policy may rank this opportunity.
+
+        Capping this at `max_num_running_reqs` conflates two quantities: how
+        many requests the engine can *run*, and how many the policy may *rank*.
+        They are the same number only when nothing is queued. A plan's ranks are
+        populated from the policy's selections alone, so once the running set is
+        full it consumes the entire allowance and no waiting request can be
+        ranked -- while `candidates()` has been publishing the waiting queue to
+        the policy the whole time, and
+        `Scheduler._select_waiting_request_for_scheduling` has been ready to act
+        on such a rank. That is why `waiting_picks` read 0 with 144 requests
+        queued: not because the engine refused the decision, but because the
+        port never let the policy express it.
+
+        Lifting the cap changes no vLLM invariant. The seat-limit break stays,
+        the engine still admits only as slots free, and it still never demotes a
+        running request. The one thing that changes is which waiting request
+        takes a freed seat: native FIFO before, the policy's ranking after.
+
+        Bounded by the protocol's working-set limit because that is what the
+        controller will actually submit -- it takes a leading prefix of
+        `candidates()`, so the policy sees the running set plus the head of the
+        queue, and an allowance larger than the submission would be an
+        over-report.
+
+        Off by default: both states are measured on one build, per
+        `experiments/regime-preregistration.md` section 6.
+        """
         scheduler = self.scheduler
-        selections = min(
-            len(self.candidates()), scheduler.max_num_running_reqs
-        )
+        candidates = len(self.candidates())
+        if envs.PLEX_SCHEDULE_RANK_WAITING:
+            selections = min(candidates, MAX_RANKABLE_CANDIDATES)
+        else:
+            selections = min(candidates, scheduler.max_num_running_reqs)
         return ScheduleCapacity(
             max_selections=selections,
             max_requests=selections,
