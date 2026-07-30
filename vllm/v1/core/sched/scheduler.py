@@ -354,6 +354,26 @@ class Scheduler(SchedulerInterface):
 
         self.plex: AsyncPlexPolicyController | None = None
         self._plex_held: dict[str, Request] = {}
+        #: Whether the scheduler ever had a choice to make. A schedule policy
+        #: can only reorder a queue that exists and can only ration a budget
+        #: that binds, so a flat scheduling result is unattributable until
+        #: these are read: `steps` against `steps_with_queue` says how often
+        #: anything was waiting, and the three `bound_*` counters say which
+        #: constraint, if any, actually forced a choice.
+        self._plex_choice: dict[str, int] = {
+            "steps": 0,
+            "steps_with_queue": 0,
+            "queue_depth_sum": 0,
+            "running_depth_sum": 0,
+            "bound_by_seqs": 0,
+            "bound_by_tokens": 0,
+            "bound_by_blocks": 0,
+            "waiting_picks": 0,
+            "waiting_diverged": 0,
+            "running_reordered": 0,
+            "running_deferred": 0,
+            "tokens_clamped": 0,
+        }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
                 self.scheduler_config.plex_policy,
@@ -477,13 +497,23 @@ class Scheduler(SchedulerInterface):
         ) and any(not r.is_prefill_chunk for r in self.running)
         self._release_plex_admissions()
         plex_plan = self.plex.poll_schedule() if self.plex is not None else None
+        if self.plex is not None:
+            queued = len(self.waiting) + len(self.skipped_waiting)
+            self._plex_choice["steps"] += 1
+            self._plex_choice["queue_depth_sum"] += queued
+            self._plex_choice["running_depth_sum"] += len(self.running)
+            if queued:
+                self._plex_choice["steps_with_queue"] += 1
         if plex_plan is not None:
+            before = [request.request_id for request in self.running]
             self.running.sort(
                 key=lambda request: (
                     plex_plan.rank(request.request_id) is None,
                     plex_plan.rank(request.request_id) or 0,
                 )
             )
+            if before != [request.request_id for request in self.running]:
+                self._plex_choice["running_reordered"] += 1
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -495,6 +525,7 @@ class Scheduler(SchedulerInterface):
                 and plex_plan.saw(request.request_id)
                 and not plex_plan.selects(request.request_id)
             ):
+                self._plex_choice["running_deferred"] += 1
                 req_index += 1
                 continue
 
@@ -546,6 +577,8 @@ class Scheduler(SchedulerInterface):
             if plex_plan is not None:
                 plex_budget = plex_plan.token_budget(request.request_id)
                 if plex_budget is not None:
+                    if plex_budget < num_new_tokens:
+                        self._plex_choice["tokens_clamped"] += 1
                     num_new_tokens = min(num_new_tokens, plex_budget)
 
             # Schedule encoder inputs.
@@ -725,6 +758,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if self.plex is not None and (self.waiting or self.skipped_waiting):
+            if token_budget <= 0:
+                self._plex_choice["bound_by_tokens"] += 1
+            if preempted_reqs:
+                self._plex_choice["bound_by_blocks"] += 1
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
@@ -733,6 +771,8 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    if self.plex is not None:
+                        self._plex_choice["bound_by_seqs"] += 1
                     break
 
                 selected_waiting = self._select_waiting_request_for_scheduling(
@@ -2091,6 +2131,10 @@ class Scheduler(SchedulerInterface):
                 if unseen is None and not plex_plan.saw(request.request_id):
                     unseen = (request_queue, request)
         if selected is not None:
+            self._plex_choice["waiting_picks"] += 1
+            native = self._select_waiting_queue_for_scheduling()
+            if native is not None and native.peek_request() is not selected[2]:
+                self._plex_choice["waiting_diverged"] += 1
             return selected[1], selected[2]
         # The plan ranks nothing runnable. A request it never saw carries no
         # decision, so admitting it natively is not overriding the policy --

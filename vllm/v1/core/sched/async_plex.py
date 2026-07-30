@@ -474,6 +474,10 @@ class VllmEnginePort:
         stats["ask_calls"] = self._plex_ask_calls
         stats["ask_wanted_sum"] = self._plex_wanted_sum
         stats["ask_offered_sum"] = self._plex_offered_sum
+        # Whether the scheduler ever had a choice for the schedule channel to
+        # make. A ranking over an empty queue is arithmetic, not a decision.
+        for key, value in getattr(self.scheduler, "_plex_choice", {}).items():
+            stats[f"sched_{key}"] = value
         return stats
 
     def residents(self) -> list[VllmRequest]:
