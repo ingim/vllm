@@ -6777,6 +6777,32 @@ def test_plex_cache_residents_count_pending_demand_as_a_beneficiary():
     )
 
 
+def test_plex_aborting_a_held_arrival_lets_the_engine_quiesce(monkeypatch):
+    """A held request is in no queue, so nothing removed it when it was aborted.
+
+    `finish_requests` clears the running list and both waiting queues, and
+    `_plex_held` is none of them. The controller could no longer resolve the id
+    either, so no admission verdict was produced and `_release_plex_admissions`
+    had nothing to pop it with. `get_num_unfinished_requests` counts
+    `_plex_held`, so the count never returned to zero: the busy loop spun on
+    empty steps, `_pause_complete` was never true, and shutdown-drain could not
+    finish. One aborted arrival is enough.
+    """
+    monkeypatch.setattr(envs, "PLEX_ADMISSION_CONTROL", True)
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.publish_plex()
+    assert scheduler._plex_held, "the fixture must actually hold the arrival"
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler._plex_held == {}
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
 def test_plex_holds_an_arrival_until_the_policy_admits_it(monkeypatch):
     """An admission decision has to land before the work starts.
 

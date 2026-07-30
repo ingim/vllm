@@ -2511,6 +2511,17 @@ class Scheduler(SchedulerInterface):
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+        # A held request is in no queue, so the removals above cannot reach it and
+        # nothing else ever did: `_plex_held` kept the entry, and because
+        # `mark_finished` drops the id the controller can no longer resolve, no
+        # admission verdict was ever produced either, so `_release_plex_admissions`
+        # had nothing to pop it with. `get_num_unfinished_requests` counts
+        # `_plex_held`, so the count never returned to zero -- the busy loop spun
+        # on empty steps, `_pause_complete` was never true, and shutdown-drain
+        # could not finish. Not a slow leak: one aborted arrival is enough.
+        if self._plex_held:
+            for request in valid_requests:
+                self._plex_held.pop(request.request_id, None)
 
         # Second pass: set status and free requests
         for request in valid_requests:
