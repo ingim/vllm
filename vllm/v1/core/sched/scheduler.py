@@ -408,6 +408,10 @@ class Scheduler(SchedulerInterface):
             "seat_no_candidate": 0,
             "seat_no_victim": 0,
             "seat_bounded": 0,
+            # Waiting picks whose rank came from an unfunded `preference[]`
+            # rather than from a funded selection. Zero on a policy that
+            # expresses no preference, which is every v0.7 policy.
+            "waiting_picked_by_preference": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -591,6 +595,11 @@ class Scheduler(SchedulerInterface):
                 plex_plan is not None
                 and plex_plan.saw(request.request_id)
                 and not plex_plan.selects(request.request_id)
+                # A request the plan merely *preferred* was ordered, not
+                # declined. Deferring it would make an unfunded ordering act
+                # like an omission, which is the thing §10.2 forbids and the
+                # whole reason `preference[]` is disjoint from `selections[]`.
+                and not plex_plan.prefers(request.request_id)
             ):
                 self._plex_choice["running_deferred"] += 1
                 req_index += 1
@@ -2364,6 +2373,7 @@ class Scheduler(SchedulerInterface):
             return request_queue, request_queue.peek_request()
 
         selected: tuple[int, RequestQueue, Request] | None = None
+        preferred = False
         unseen: tuple[RequestQueue, Request] | None = None
         self._plex_choice["waiting_calls"] += 1
         for request_queue in (self.waiting, self.skipped_waiting):
@@ -2376,6 +2386,7 @@ class Scheduler(SchedulerInterface):
                     self._plex_choice["waiting_ranked_sum"] += 1
                 if rank is not None and (selected is None or rank < selected[0]):
                     selected = (rank, request_queue, request)
+                    preferred = plex_plan.prefers(request.request_id)
                 if unseen is None and not plex_plan.saw(request.request_id):
                     unseen = (request_queue, request)
         if selected is None and unseen is None:
@@ -2384,6 +2395,8 @@ class Scheduler(SchedulerInterface):
             self._plex_choice["waiting_none_runnable"] += 1
         if selected is not None:
             self._plex_choice["waiting_picks"] += 1
+            if preferred:
+                self._plex_choice["waiting_picked_by_preference"] += 1
             native = self._select_waiting_queue_for_scheduling()
             if native is not None and native.peek_request() is not selected[2]:
                 self._plex_choice["waiting_diverged"] += 1

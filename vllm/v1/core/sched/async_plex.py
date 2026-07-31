@@ -69,6 +69,7 @@ class VllmRequest:
         "_cached_blocks",
         "_attained_service",
         "_child_count",
+        "_pending_blocks",
     )
 
     def __init__(
@@ -79,7 +80,11 @@ class VllmRequest:
         cached_blocks: int | None = None,
         attained_service: int | None = None,
         child_count: int = 0,
+        pending_blocks: int = 0,
     ) -> None:
+        #: Full blocks this request has produced that the pool has not inserted.
+        #: Non-zero only on a prospective entry; see `pending_bytes`.
+        self._pending_blocks = pending_blocks
         self._request = request
         self._scheduler = scheduler
         self._signals = signals if signals is not None else NO_SIGNALS
@@ -261,6 +266,17 @@ class VllmRequest:
             ),
             0,
         )
+
+    def pending_bytes(self) -> int:
+        """Bytes this object is about to add to the cache, not what it holds.
+
+        A prospective entry for a partly-resident object must not restate the
+        whole object's size: §11.3's retained-bytes sum adds resident bytes and
+        prospective bytes together, so counting the same blocks twice would make
+        a policy's admission look like it overran a budget it never touched.
+        """
+        blocks = self._pending_blocks or 0
+        return blocks * page_size_bytes(self._scheduler)
 
     def size_bytes(self) -> int:
         """One reclaim unit.
@@ -502,13 +518,17 @@ class VllmEnginePort:
         self._parked[request.request_id] = request
 
     def view(
-        self, request: Request, attained_service: int | None = None
+        self,
+        request: Request,
+        attained_service: int | None = None,
+        pending_blocks: int = 0,
     ) -> VllmRequest:
         return VllmRequest(
             request,
             self.scheduler,
             self._signals.get(request.request_id),
             attained_service=attained_service,
+            pending_blocks=pending_blocks,
         )
 
     def candidates(self) -> list[VllmRequest]:
@@ -700,21 +720,28 @@ class VllmEnginePort:
         empty answer and an empty question are indistinguishable in the
         counters, which is the failure this whole project is about.
 
-        A running request whose prefix the pool does not yet own is exactly the
-        object about to be inserted. Residents are excluded by the controller,
-        because section 11.3 forbids an object appearing in both sets.
+        A running request with full blocks the pool has not inserted is exactly
+        the object about to be cached — and it is usually *also* a resident,
+        because some of its earlier blocks are already in. §11.3 rule 2 forbids
+        an object appearing in both sets, which for a per-request object
+        identity makes the admission half unreachable for every request that
+        matters; the v0.8 amendment allows the overlap and requires a
+        prospective entry to report only the *incremental* bytes, so the
+        retained-bytes arithmetic still adds up.
         """
         scheduler = self.scheduler
         pool = scheduler.kv_cache_manager.block_pool
-        owned = pool.plex_owned_requests()
+        per_block = block_tokens(scheduler)
         offered: list[VllmRequest] = []
         for request in scheduler.running:
-            if request.request_id in owned or request.is_finished():
+            if request.is_finished():
                 continue
-            if request.num_computed_tokens < block_tokens(scheduler):
-                # Nothing full to insert yet, so there is no decision to put.
+            full = request.num_computed_tokens // per_block if per_block else 0
+            cached = len(pool.plex_owner_block_ids(request.request_id))
+            if full <= cached:
+                # Nothing full and uninserted, so there is no decision to put.
                 continue
-            offered.append(self.view(request))
+            offered.append(self.view(request, pending_blocks=full - cached))
         return offered
 
     def cache_capacity(self, residents: list[VllmRequest]) -> CacheCapacity:

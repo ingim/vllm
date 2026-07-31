@@ -875,6 +875,10 @@ class BlockPool:
             ret.extend(tail)
         return ret
 
+    def plex_owner_block_ids(self, request_id: str) -> dict:
+        """Blocks the pool currently holds for this request, insertion-ordered."""
+        return self._plex_owner_blocks.get(request_id, {})
+
     def plex_owned_requests(self) -> set[str]:
         """Requests the pool already holds cached blocks for."""
         return set(self._plex_owner_blocks)
