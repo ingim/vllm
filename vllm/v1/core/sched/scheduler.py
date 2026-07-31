@@ -565,6 +565,23 @@ class Scheduler(SchedulerInterface):
             if before != [request.request_id for request in self.running]:
                 self._plex_choice["running_reordered"] += 1
 
+        # Free a seat before anything is scheduled, not during. A request
+        # demoted mid-loop has already been placed in this step's output, and
+        # the model runner then sees it both scheduled and preempted -- a
+        # KeyError that kills the engine core, reproduced on the first live run.
+        # `request.pause@1` drains at the same point for the same reason.
+        if (
+            plex_plan is not None
+            and envs.PLEX_SCHEDULE_RANK_BREAKS_SEAT
+            and self._pause_state == PauseState.UNPAUSED
+            and (self.waiting or self.skipped_waiting)
+            and len(self.running) + self.num_waiting_for_streaming_input
+            >= self.max_num_running_reqs
+        ):
+            self._plex_free_seat_for_plan(
+                plex_plan, native_running_order, scheduled_timestamp
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -839,14 +856,7 @@ class Scheduler(SchedulerInterface):
                     # refusing to enact it because the engine's own admission
                     # rule is "as slots free" is the engine winning an argument
                     # the contract gives to the policy.
-                    if not (
-                        envs.PLEX_SCHEDULE_RANK_BREAKS_SEAT
-                        and self._plex_free_seat_for_plan(
-                            plex_plan, native_running_order, scheduled_timestamp
-                        )
-                    ):
-                        break
-                    continue
+                    break
 
                 selected_waiting = self._select_waiting_request_for_scheduling(
                     plex_plan
