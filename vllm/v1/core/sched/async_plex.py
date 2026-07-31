@@ -1118,6 +1118,7 @@ class AsyncPlexPolicyController:
                 target_id=target_id,
                 plan_persists=envs.PLEX_PLAN_PERSISTS,
                 decision_deadline_s=envs.PLEX_DECISION_DEADLINE_MS / 1000.0,
+                plan_ttl_s=envs.PLEX_PLAN_TTL_MS / 1000.0,
             ),
             port,
         )

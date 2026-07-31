@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     PLEX_PLAN_PERSISTS: bool = True
     PLEX_SCHEDULE_RANK_BREAKS_SEAT: bool = True
     PLEX_DECISION_DEADLINE_MS: int = 0
+    PLEX_PLAN_TTL_MS: int = 2000
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -870,6 +871,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PLEX_DECISION_DEADLINE_MS": lambda: int(
         os.getenv("PLEX_DECISION_DEADLINE_MS", "0")
     ),
+    # How long a plan may be used after it was asked for. The SDK default of
+    # 250 ms was set when a plan was spent in one step. Measured at 651
+    # candidates, 89% of answers arrived past it against 26% at 127, while the
+    # policy answered about as often in both -- a round-trip scales with the
+    # context it carries and a fixed deadline does not, so the channel read as
+    # emptiest at the load where it had the most to decide.
+    "PLEX_PLAN_TTL_MS": lambda: int(os.getenv("PLEX_PLAN_TTL_MS", "2000")),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
