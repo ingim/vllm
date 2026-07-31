@@ -690,6 +690,33 @@ class VllmEnginePort:
             max_total_tokens=scheduler.max_num_scheduled_tokens,
         )
 
+    def prospective(self) -> list[VllmRequest]:
+        """Requests whose blocks are about to enter the prefix cache.
+
+        The contract's cache channel has an admission half -- `admissions[]`,
+        dense over `prospective[]` -- and this port published an empty list on
+        every run it ever made, so the `CacheAdmission` lane of saga, preble,
+        marconi, kvflow and coordinated was a no-op that nothing reported. An
+        empty answer and an empty question are indistinguishable in the
+        counters, which is the failure this whole project is about.
+
+        A running request whose prefix the pool does not yet own is exactly the
+        object about to be inserted. Residents are excluded by the controller,
+        because section 11.3 forbids an object appearing in both sets.
+        """
+        scheduler = self.scheduler
+        pool = scheduler.kv_cache_manager.block_pool
+        owned = pool.plex_owned_requests()
+        offered: list[VllmRequest] = []
+        for request in scheduler.running:
+            if request.request_id in owned or request.is_finished():
+                continue
+            if request.num_computed_tokens < block_tokens(scheduler):
+                # Nothing full to insert yet, so there is no decision to put.
+                continue
+            offered.append(self.view(request))
+        return offered
+
     def cache_capacity(self, residents: list[VllmRequest]) -> CacheCapacity:
         """Budget the shortfall the engine is about to take from the cache.
 
@@ -1099,6 +1126,10 @@ class AsyncPlexPolicyController:
         # real eviction stays with the LRU free queue.
         scheduler.kv_cache_manager.block_pool.set_plex_eviction_order(
             controller.eviction_order
+        )
+        # And the admission half, which had no consumer at all.
+        scheduler.kv_cache_manager.block_pool.set_plex_cache_bypass(
+            controller.controller.cache_bypassed
         )
         return controller
 

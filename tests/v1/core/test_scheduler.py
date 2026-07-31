@@ -7320,3 +7320,34 @@ def test_plex_a_rank_takes_a_seat_when_the_engine_would_have_stopped(monkeypatch
     assert second.status == RequestStatus.RUNNING, "omission chose the victim"
     assert scheduler._plex_choice["seat_freed_for_plan"] == 1
 
+
+
+def test_plex_cache_admission_is_asked_about_real_objects_and_bypass_is_honoured():
+    """The admission half of the cache channel had no question and no consumer.
+
+    `events.cache_event` hardcoded `"prospective": []` and nothing parsed
+    `admissions[]`, so the `CacheAdmission` lane of saga, preble, marconi,
+    kvflow and coordinated was a no-op on every run this project ever made --
+    and an empty answer is indistinguishable from an empty question in the
+    counters, which is the failure the whole project is about.
+    """
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler(enable_prefix_caching=True, num_blocks=64)
+    plex = attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=48, max_tokens=4)
+    pool = scheduler.kv_cache_manager.block_pool
+    declined = {requests[0].request_id}
+    pool.set_plex_cache_bypass(lambda: declined)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+    scheduler.schedule()
+
+    assert pool._plex_admission_bypassed > 0, "the bypass was not honoured"
+    owned = pool.plex_owned_requests()
+    assert requests[0].request_id not in owned, "a declined object was cached"
+
+    # And the policy is asked about something: a running request the pool holds
+    # nothing for is exactly the object about to be inserted.
+    assert plex.port.prospective(), "the policy is still asked about nothing"

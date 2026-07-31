@@ -246,6 +246,12 @@ class BlockPool:
         #: only the second is a block any ranking could have saved or spent.
         self._plex_hit_on_live = 0
         self._plex_hit_on_free = 0
+        #: The policy's cache-admission answer, and how many insertions it
+        #: declined. `bypass` prevents persistent insertion even when there is
+        #: free capacity -- section 11.2 -- so this is the one place the answer
+        #: can be honoured.
+        self._plex_cache_bypass = None
+        self._plex_admission_bypassed = 0
         self._plex_evict_diverged = 0
         #: When each owner's cached prefix was last *hit*, which is the only
         #: evidence a resident is still worth keeping. Read by the port for
@@ -345,6 +351,18 @@ class BlockPool:
         """
         if num_cached_blocks >= num_full_blocks:
             return
+        # The policy's admission answer, honoured at the only point it can be:
+        # `bypass` prevents persistent insertion even when capacity is free
+        # (`docs/plex_0.6_contract.md` section 11.2), so it has to be checked
+        # before the block enters the hash map rather than evicted afterwards.
+        if self._plex_cache_bypass is not None:
+            try:
+                declined = self._plex_cache_bypass()
+            except Exception:
+                declined = ()
+            if request.request_id in declined:
+                self._plex_admission_bypassed += 1
+                return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
         block_hashes = resolve_block_hashes(
@@ -857,6 +875,14 @@ class BlockPool:
             ret.extend(tail)
         return ret
 
+    def plex_owned_requests(self) -> set[str]:
+        """Requests the pool already holds cached blocks for."""
+        return set(self._plex_owner_blocks)
+
+    def set_plex_cache_bypass(self, source) -> None:
+        """Install the policy's admission answer, read at every insertion."""
+        self._plex_cache_bypass = source
+
     def plex_eviction_stats(self) -> dict[str, int]:
         """Who actually decided each cached block's eviction."""
         return {
@@ -877,6 +903,7 @@ class BlockPool:
             # it was hit. Only the second kind is reachable by any eviction
             # order, so the ratio bounds how much a cache policy could have
             # changed the hit rate at all.
+            "admission_bypassed": self._plex_admission_bypassed,
             "hit_on_live_blocks": self._plex_hit_on_live,
             "hit_on_free_blocks": self._plex_hit_on_free,
         }
