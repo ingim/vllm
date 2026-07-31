@@ -10,7 +10,7 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
 StructuredOutputsBackend = Literal[
-    "auto", "xgrammar", "guidance", "outlines", "lm-format-enforcer", "gpugrammar"
+    "auto", "xgrammar", "guidance", "outlines", "lm-format-enforcer", "engrain"
 ]
 
 
@@ -64,11 +64,11 @@ class StructuredOutputsConfig:
         if self.disable_any_whitespace and self.backend not in (
             "xgrammar",
             "guidance",
-            "gpugrammar",
+            "engrain",
         ):
             raise ValueError(
                 "disable_any_whitespace is only supported for "
-                "xgrammar, guidance and gpugrammar backends."
+                "xgrammar, guidance and engrain backends."
             )
         if self.disable_additional_properties and self.backend != "guidance":
             raise ValueError(

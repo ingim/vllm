@@ -137,12 +137,12 @@ class StructuredOutputManager:
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
                 )
-            elif backend == "gpugrammar":
-                from vllm.v1.structured_output.backend_gpugrammar import (
-                    GpuGrammarBackend,
+            elif backend == "engrain":
+                from vllm.v1.structured_output.backend_engrain import (
+                    EngrainBackend,
                 )
 
-                self.backend = GpuGrammarBackend(
+                self.backend = EngrainBackend(
                     self.vllm_config,
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,

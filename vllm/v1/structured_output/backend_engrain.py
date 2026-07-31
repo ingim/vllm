@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A structured-output backend backed by the gpugrammar compiler.
+"""A structured-output backend backed by the engrain compiler.
 
-gpugrammar compiles a grammar to LALR(1) tables and a byte lexer, then groups
+engrain compiles a grammar to LALR(1) tables and a byte lexer, then groups
 the vocabulary by what a token does to the lexer. A mask is the union of the
 groups the parser admits, so per-step work is one table replay per group - a
 few hundred, and independent of vocabulary size - rather than a walk over the
@@ -46,7 +46,7 @@ def _vocabulary(tokenizer) -> list[bytes]:
 
 
 @dataclass
-class GpuGrammarGrammar(StructuredOutputGrammar):
+class EngrainGrammar(StructuredOutputGrammar):
     matcher: object
     words: int
     stop_token_ids: list[int]
@@ -143,11 +143,11 @@ class GpuGrammarGrammar(StructuredOutputGrammar):
 
 
 @dataclass
-class GpuGrammarBackend(StructuredOutputBackend):
+class EngrainBackend(StructuredOutputBackend):
     def __post_init__(self) -> None:
-        import gpugrammar
+        import engrain
 
-        self.compiler = gpugrammar.Compiler(_vocabulary(self.tokenizer))
+        self.compiler = engrain.Compiler(_vocabulary(self.tokenizer))
         self.stop_token_ids = [
             token
             for token in [getattr(self.tokenizer, "eos_token_id", None)]
@@ -165,7 +165,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
         # under is evicted, and re-admitted from the cached artifact if it comes
         # back - a device copy, not a recompile.
         self.table_budget_bytes = int(
-            os.environ.get("GPUGRAMMAR_TABLE_BUDGET_MB", "1024")
+            os.environ.get("ENGRAIN_TABLE_BUDGET_MB", "1024")
         ) * (1 << 20)
         self.batch: object = None
         self.max_num_seqs = max(
@@ -183,7 +183,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
         # rare and it is a wrong mask, which is the worst combination.
         self.lock = threading.RLock()
         try:
-            from gpugrammar import _engine as device_parser
+            from engrain import _engine as device_parser
 
             self.device_parser = device_parser
         except Exception:  # noqa: BLE001
@@ -229,7 +229,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
             # Left to the first fill, Triton would compile inside a decode step
             # and vLLM would rightly call it a latency spike.
             self._batch_for(self.max_num_seqs)
-        return GpuGrammarGrammar(
+        return EngrainGrammar(
             matcher=compiled.matcher(32),
             words=compiled.bitset_words,
             stop_token_ids=self.stop_token_ids,
@@ -285,7 +285,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
             bitmask[index, :width].copy_(host[row])
             bitmask[index, width:].zero_()
             grammar._allow_stops(bitmask[index])
-        if os.environ.get("GPUGRAMMAR_VERIFY"):
+        if os.environ.get("ENGRAIN_VERIFY"):
             self._verify(rows, host)
 
     def _verify(self, rows, host) -> None:
@@ -302,7 +302,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
                 extra = int(((host[row] & ~reference) != 0).sum())
                 missing = int(((reference & ~host[row]) != 0).sum())
                 print(
-                    f"GPUGRAMMAR row {row} (bitmask {index}, grammar "
+                    f"ENGRAIN row {row} (bitmask {index}, grammar "
                     f"{grammar.grammar_id}): {extra} words with extra bits, "
                     f"{missing} with missing",
                     flush=True,
@@ -312,7 +312,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
                 solo.set_batch_configurations({0: grammar.matcher.configurations()})
                 alone = solo.fill_mask()[0].cpu()
                 print(
-                    "GPUGRAMMAR   same row computed alone: "
+                    "ENGRAIN   same row computed alone: "
                     + ("agrees with the batch" if torch.equal(alone, host[row])
                        else "DIFFERS from the batch")
                     + "; alone vs matcher: "
@@ -320,7 +320,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
                     flush=True,
                 )
                 print(
-                    "GPUGRAMMAR state "
+                    "ENGRAIN state "
                     + json.dumps(
                         [
                             {
@@ -366,7 +366,7 @@ class GpuGrammarBackend(StructuredOutputBackend):
             return self.compiler.compile_regex(grammar_spec)
         if request_type == StructuredOutputOptions.GRAMMAR:
             return self.compiler.compile_ebnf(grammar_spec, "root")
-        raise ValueError(f"gpugrammar does not support {request_type}")
+        raise ValueError(f"engrain does not support {request_type}")
 
     def allocate_token_bitmask(self, max_num_seqs: int) -> torch.Tensor:
         # Filled rows are written wholesale; unfilled rows must allow
