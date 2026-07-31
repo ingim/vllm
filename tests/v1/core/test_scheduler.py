@@ -7239,3 +7239,52 @@ def test_plex_pause_discards_the_output_frames_already_in_flight(monkeypatch):
     # The stale frame arriving is absorbed rather than fatal.
     _model_output(scheduler, first_step, [[100]] * len(first_step.num_scheduled_tokens))
     assert second.num_output_placeholders == 0
+
+
+def test_plex_counts_whether_a_prefix_hit_was_reachable_by_any_eviction_order():
+    """A hit on a referenced block is one no ranking could have changed.
+
+    Only free blocks sit in the eviction queue, so a cache policy's order
+    governs exactly the blocks nobody currently holds. Six policies measure flat
+    on `prefix_hit_rate` on this engine with their eviction decisions proven to
+    differ from LRU by 18% to 90%, and nothing counted whether their decisions
+    could have reached the hits at all -- which makes six negatives a property
+    of the policies when it may be a property of the workload.
+
+    Here the same prefix is hit twice: once while the first request still holds
+    it, and once after that request has gone and the blocks are free.
+    """
+    scheduler = create_scheduler(enable_prefix_caching=True, num_blocks=64)
+    pool = scheduler.kv_cache_manager.block_pool
+    first, second = create_requests(
+        num_requests=2, num_tokens=48, max_tokens=4, same_prompt=True
+    )
+    scheduler.add_request(first)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]] * len(output.num_scheduled_tokens))
+    live_before = pool._plex_hit_on_live
+    free_before = pool._plex_hit_on_free
+
+    # `first` is still running, so its blocks are referenced.
+    scheduler.add_request(second)
+    scheduler.schedule()
+    assert pool._plex_hit_on_live > live_before, (
+        "a hit while the owner is running was not counted as unreachable"
+    )
+    assert pool._plex_hit_on_free == free_before
+
+    # Retire both, so the blocks fall to the free queue where a ranking reaches
+    # them, and hit the same prefix again.
+    scheduler.finish_requests(
+        [first.request_id, second.request_id], RequestStatus.FINISHED_ABORTED
+    )
+    live_after = pool._plex_hit_on_live
+    third = create_requests(
+        num_requests=3, num_tokens=48, max_tokens=4, same_prompt=True
+    )[2]
+    scheduler.add_request(third)
+    scheduler.schedule()
+    assert pool._plex_hit_on_free > free_before, (
+        "a hit on a free block was not counted as reachable"
+    )
+    assert pool._plex_hit_on_live == live_after

@@ -241,6 +241,11 @@ class BlockPool:
         #: block it names -- so without a divergence count the share measures
         #: which pointer the block arrived through, not who decided it.
         self._plex_evicted_no_ranking = 0
+        #: Prefix hits that landed on a block a live request still held, and on
+        #: one that was free. Only free blocks sit in the eviction queue, so
+        #: only the second is a block any ranking could have saved or spent.
+        self._plex_hit_on_live = 0
+        self._plex_hit_on_free = 0
         self._plex_evict_diverged = 0
         #: When each owner's cached prefix was last *hit*, which is the only
         #: evidence a resident is still worth keeping. Read by the port for
@@ -289,6 +294,18 @@ class BlockPool:
             )
             if not block:
                 return None
+            # Whether this hit landed on a block the policy could ever have
+            # ranked. A cached block with `ref_cnt > 0` is held by a live
+            # request and is not in the free queue, so no eviction order
+            # reaches it -- an eviction policy governs only the blocks nobody
+            # is currently using. Six policies measure flat on `prefix_hit_rate`
+            # here with their eviction decisions proven to differ from LRU, and
+            # this pair is what says whether that is a property of the policies
+            # or of the workload.
+            if block.ref_cnt > 0:
+                self._plex_hit_on_live += 1
+            else:
+                self._plex_hit_on_free += 1
             cached_blocks.append(block)
         return cached_blocks
 
@@ -856,6 +873,12 @@ class BlockPool:
             "rank_len_sum": self._plex_rank_len_sum,
             "rank_census_sum": self._plex_census_len_sum,
             "rank_exhausted": self._plex_rank_exhausted,
+            # Prefix hits split by whether the block was still referenced when
+            # it was hit. Only the second kind is reachable by any eviction
+            # order, so the ratio bounds how much a cache policy could have
+            # changed the hit rate at all.
+            "hit_on_live_blocks": self._plex_hit_on_live,
+            "hit_on_free_blocks": self._plex_hit_on_free,
         }
 
     def _plex_own(self, block_id: int, owner: str) -> None:
