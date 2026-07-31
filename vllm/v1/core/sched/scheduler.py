@@ -401,6 +401,13 @@ class Scheduler(SchedulerInterface):
             # off this is the only evidence that a policy is not starving one,
             # so it is measured rather than assumed.
             "max_request_preemptions": 0,
+            # Seats taken from a running request because the plan ranked a
+            # queued one above it. The engine used to stop at the seat limit
+            # without asking; these say what happened when it asked.
+            "seat_freed_for_plan": 0,
+            "seat_no_candidate": 0,
+            "seat_no_victim": 0,
+            "seat_bounded": 0,
         }
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
@@ -824,7 +831,22 @@ class Scheduler(SchedulerInterface):
                 if num_running >= self.max_num_running_reqs:
                     if self.plex is not None:
                         self._plex_choice["bound_by_seqs"] += 1
-                    break
+                    # The engine used to stop here without asking anyone, which
+                    # is the state the schedule channel spends most of a loaded
+                    # run in: the seat limit binds on 87% of steps and the queue
+                    # behind it is invisible. A policy that ranks a queued
+                    # request above a running one has expressed a decision, and
+                    # refusing to enact it because the engine's own admission
+                    # rule is "as slots free" is the engine winning an argument
+                    # the contract gives to the policy.
+                    if not (
+                        envs.PLEX_SCHEDULE_RANK_BREAKS_SEAT
+                        and self._plex_free_seat_for_plan(
+                            plex_plan, native_running_order, scheduled_timestamp
+                        )
+                    ):
+                        break
+                    continue
 
                 selected_waiting = self._select_waiting_request_for_scheduling(
                     plex_plan
@@ -2248,6 +2270,67 @@ class Scheduler(SchedulerInterface):
         )
         self.running.remove(victim)
         return victim
+
+    def _plex_free_seat_for_plan(
+        self,
+        plex_plan: PlexSchedulePlan | None,
+        native_order: list[str] | None,
+        timestamp: float,
+    ) -> bool:
+        """Take a seat from a running request the plan ranks below a queued one.
+
+        Only rank against rank, and only between requests the plan *selected*.
+        Omission is not a demand for a seat -- `docs/plex_0.7.md` section 13
+        forbids reading it as one, and an earlier version of this that demoted
+        on omission was caught by its own acceptance test demoting a request the
+        plan had chosen. A policy that wants a specific request paused says so
+        with `request.pause@1`; this is the weaker statement the contract does
+        make, which is that one selected request is preferred to another.
+
+        The victim keeps its seat if it has already been displaced
+        `PLEX_DEMOTION_LIMIT` times, when that bound is on.
+        """
+        if plex_plan is None:
+            return False
+        best_queued: int | None = None
+        for request_queue in (self.waiting, self.skipped_waiting):
+            for request in request_queue:
+                rank = plex_plan.rank(request.request_id)
+                if rank is not None and (best_queued is None or rank < best_queued):
+                    best_queued = rank
+        if best_queued is None:
+            self._plex_choice["seat_no_candidate"] += 1
+            return False
+
+        position = {
+            request_id: index for index, request_id in enumerate(native_order or ())
+        }
+        limit = envs.PLEX_DEMOTION_LIMIT
+        victim: Request | None = None
+        victim_key: tuple[int, int] | None = None
+        bounded = False
+        for request in self.running:
+            if request.status != RequestStatus.RUNNING:
+                continue
+            rank = plex_plan.rank(request.request_id)
+            if rank is None or rank <= best_queued:
+                continue
+            if limit > 0 and request.num_preemptions >= limit:
+                bounded = True
+                continue
+            # Worst rank first, and the engine's own order breaks a tie so a
+            # plan's ordering never becomes an eviction order by itself.
+            key = (-rank, -position.get(request.request_id, len(position)))
+            if victim_key is None or key < victim_key:
+                victim, victim_key = request, key
+
+        if victim is None:
+            self._plex_choice["seat_bounded" if bounded else "seat_no_victim"] += 1
+            return False
+        self.running.remove(victim)
+        self.preempt_out_of_band(victim, timestamp, initiator="policy")
+        self._plex_choice["seat_freed_for_plan"] += 1
+        return True
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

@@ -1085,7 +1085,12 @@ class AsyncPlexPolicyController:
         logger.info("Enabling PLEX with policy %s", policy)
         controller = cls(
             PolicyController.from_policy(
-                policy, port, model=model, target_id=target_id
+                policy,
+                port,
+                model=model,
+                target_id=target_id,
+                plan_persists=envs.PLEX_PLAN_PERSISTS,
+                decision_deadline_s=envs.PLEX_DECISION_DEADLINE_MS / 1000.0,
             ),
             port,
         )

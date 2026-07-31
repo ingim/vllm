@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     PLEX_SCHEDULE_RANK_WAITING: bool = False
     PLEX_SCHEDULE_ALLOW_DEMOTION: bool = False
     PLEX_DEMOTION_LIMIT: int = 0
+    PLEX_PLAN_PERSISTS: bool = True
+    PLEX_SCHEDULE_RANK_BREAKS_SEAT: bool = True
+    PLEX_DECISION_DEADLINE_MS: int = 0
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -849,6 +852,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from 451 steps to 23. A host bound that can only be enforced by destroying
     # the answer costs more than the starvation it prevents.
     "PLEX_DEMOTION_LIMIT": lambda: int(os.getenv("PLEX_DEMOTION_LIMIT", "0")),
+    # Let a schedule plan's ordering outlive the step that spent its token
+    # allocation, as the cache channel's reclaim order already outlives its
+    # victim. On by default: with them welded the policy was asked on 1.4% of
+    # the steps where its decision applied. Set to 0 to measure that state.
+    "PLEX_PLAN_PERSISTS": lambda: bool(int(os.getenv("PLEX_PLAN_PERSISTS", "1"))),
+    # Let a plan's rank take a seat from a running request when it ranks a
+    # queued one above it. Without this the engine stops at the seat limit
+    # without asking, which is 87% of steps under load.
+    "PLEX_SCHEDULE_RANK_BREAKS_SEAT": lambda: bool(
+        int(os.getenv("PLEX_SCHEDULE_RANK_BREAKS_SEAT", "1"))
+    ),
+    # Milliseconds the engine will block at a schedule boundary waiting for the
+    # policy. 0 is the asynchronous default, under which the engine steps about
+    # ten times per answer and the policy is sampled rather than consulted. The
+    # cost of a positive value is throughput, which is a number to report.
+    "PLEX_DECISION_DEADLINE_MS": lambda: int(
+        os.getenv("PLEX_DECISION_DEADLINE_MS", "0")
+    ),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages

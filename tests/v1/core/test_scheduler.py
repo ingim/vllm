@@ -6985,6 +6985,7 @@ def _plex_pause_fixture(
     monkeypatch, *, allow: bool, kv: str = "release", limit: int = 3,
     already_displaced: int = 0, name: str | None = None,
     async_scheduling: bool = False, feed_output: bool = True,
+    rank_breaks_seat: bool = False, with_action: bool = True,
 ):
     """Two seats, three requests, and a policy that pauses one to admit another.
 
@@ -6994,6 +6995,12 @@ def _plex_pause_fixture(
     """
     monkeypatch.setenv("PLEX_SCHEDULE_ALLOW_DEMOTION", "1" if allow else "0")
     monkeypatch.setenv("PLEX_DEMOTION_LIMIT", str(limit))
+    # These pin `request.pause@1`, where the policy names its victim. The
+    # rank-against-rank seat break is a different mechanism and would demote
+    # here too; it has its own test.
+    monkeypatch.setenv(
+        "PLEX_SCHEDULE_RANK_BREAKS_SEAT", "1" if rank_breaks_seat else "0"
+    )
     runtime = FakeAsyncRuntime()
     scheduler = create_scheduler(
         num_blocks=64,
@@ -7055,7 +7062,7 @@ def _plex_pause_fixture(
                 },
             },
             "state_update": {"shared": None, "groups": [], "requests": []},
-            "actions": [
+            "actions": [] if not with_action else [
                 {
                     "mechanic": "request.pause@1",
                     "method": "plex.request.pause@1",
@@ -7288,3 +7295,28 @@ def test_plex_counts_whether_a_prefix_hit_was_reachable_by_any_eviction_order():
         "a hit on a free block was not counted as reachable"
     )
     assert pool._plex_hit_on_live == live_after
+
+
+def test_plex_a_rank_takes_a_seat_when_the_engine_would_have_stopped(monkeypatch):
+    """The engine used to stop at the seat limit without asking anyone.
+
+    Measured, that is 87% of steps under load, and the queue behind it is
+    invisible for all of them -- a policy's ordering of the queue decides
+    nothing during the only period in which there is anything to decide.
+
+    This is the weaker statement the contract does make, distinct from
+    `request.pause@1` where the policy names a victim: one selected request is
+    preferred to another. Omission is still inert, per section 13, and an
+    earlier version that demoted on omission was caught by its own test
+    demoting a request the plan had chosen.
+    """
+    scheduler, _runtime, _final, _out, first, second, third = _plex_pause_fixture(
+        monkeypatch, allow=False, limit=0, rank_breaks_seat=True, with_action=False
+    )
+    # The plan ranks the queued request 0 and `first` 1, and declines `second`.
+    # Only the rank comparison may act: `second` was omitted, not outranked.
+    assert third.status == RequestStatus.RUNNING, "the rank did not take a seat"
+    assert first.status == RequestStatus.PREEMPTED, "the wrong request lost its seat"
+    assert second.status == RequestStatus.RUNNING, "omission chose the victim"
+    assert scheduler._plex_choice["seat_freed_for_plan"] == 1
+
