@@ -225,8 +225,33 @@ class VllmRequest:
                 or request.status == RequestStatus.PREEMPTED
                 else "resident"
             ),
-            "tier": "gpu",
+            **self._tier_facts(),
         }
+
+    def _tier_facts(self) -> dict[str, Any]:
+        """Which tier holds this object -- when the port can actually tell.
+
+        `tier: "gpu"` was asserted unconditionally, which was true for as long
+        as the GPU was the only tier there was. With a KV connector configured
+        it stops being true and starts being a *claim*, and Gap 16 records why
+        that is worse than saying nothing: a policy branching on a fact cannot
+        tell an uninformative answer from a measured one, so a `ragcache` or
+        `kvflow` ranking on residency would read "gpu" for an object with a host
+        copy and rank it as though reloading were free.
+
+        This port cannot yet answer per object. The connector's
+        `OffloadingManager` has exactly the query -- `lookup(key)` returns HIT,
+        MISS or HIT_PENDING -- but reaching it needs the block hashes for this
+        request keyed the way the manager keys them, and the public path,
+        `get_num_new_matched_tokens`, is part of the scheduling protocol and has
+        side effects that make it unsafe to call for a fact.
+
+        So the fact is published when the GPU is the whole cache and withheld
+        when it is not, and U5/U8/U10 records what is left to build.
+        """
+        if getattr(self._scheduler, "connector", None) is None:
+            return {"tier": "gpu"}
+        return {}
 
     def token_budget(self) -> int:
         request = self._request
@@ -828,8 +853,36 @@ class VllmEnginePort:
         # `max_bytes` so the two are commensurable.
         offered = {resident.engine_id for resident in residents}
         unoffered = sum(1 for owner in census if owner not in offered)
+        # `max_bytes` has to be a budget the *whole* retained sum is measured
+        # against, and §11.3's sum is `fixed_bytes` plus every resident the plan
+        # keeps plus every prospective object it admits. Amendment 5 put the
+        # unoffered objects into `fixed_bytes` -- correctly, they are real and
+        # numerous -- and left `max_bytes` as residents-minus-wanted, which
+        # budgets for neither term.
+        #
+        # The result was a budget nothing could satisfy. With `wanted` at its
+        # cap the budget is a single unit, while `fixed_bytes` alone is
+        # `unit * unoffered`, so one preempted request anywhere in the census
+        # put every plan over and the host refused it whole. Measured on the
+        # calibrated batch: `peek` retained 24,117,248 bytes against a budget of
+        # 622,592 and fell back on 2,171 of 2,289 invocations, `pythia` on 1,574
+        # of 3,966, `hotprefix` on 1,197 of 2,789 -- three cache arms reported as
+        # refused for a defect in the question rather than in any answer.
+        #
+        # The prospective term is the same error a second time: residents are
+        # priced at one reclaim unit each and a prospective entry reports its
+        # real incremental bytes, so admitting anything at all overran a budget
+        # denominated in units. The budget now carries what the engine is about
+        # to insert regardless, which leaves the admission genuinely free and
+        # keeps the pressure where it belongs -- the policy must still give up
+        # `wanted` of the residents it was offered.
+        admissible = sum(request.pending_bytes() for request in self.prospective())
         return CacheCapacity(
-            max_bytes=max(unit * len(residents) - unit * wanted, 0),
+            max_bytes=(
+                unit * unoffered
+                + max(unit * len(residents) - unit * wanted, 0)
+                + admissible
+            ),
             fixed_bytes=unit * unoffered,
             facts={"virtual_request_pressure": True},
         )
