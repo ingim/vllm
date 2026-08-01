@@ -385,6 +385,7 @@ class Scheduler(SchedulerInterface):
             "waiting_seen_sum": 0,
             "waiting_ranked_sum": 0,
             "waiting_none_runnable": 0,
+            "waiting_declined_native": 0,
             # Admissions the plan carried no decision about, where the request
             # admitted was still not the one the engine would have chosen.
             "unseen_diverged": 0,
@@ -2445,7 +2446,33 @@ class Scheduler(SchedulerInterface):
             native = self._select_waiting_queue_for_scheduling()
             if native is not None and native.peek_request() is not unseen[1]:
                 self._plex_choice["unseen_diverged"] += 1
-        return unseen
+            return unseen
+        # v0.8 amendment, Gap 22. A plan that ranks **nothing at all** over a
+        # non-empty `considered[]` is declining to rule on this channel, not
+        # ruling that nobody may run, and the engine schedules natively.
+        #
+        # The distinction is the whole of it, and a wider version of this change
+        # was written first and reverted because two conformance tests caught it:
+        #
+        #   plan ranks {1}, considered {0,1}, 1 already running
+        #       -> "none of these". 0 was offered and not chosen. Admit nobody.
+        #   plan ranks {}, considered {0,1}
+        #       -> no opinion. Nothing was chosen because the policy had nothing
+        #          to say about ordering. Admit natively.
+        #
+        # Only the second is changed here. Without it a cache- or route-channel
+        # policy, whose schedule plan is empty because scheduling order is not
+        # its mechanism, halts the engine: the step admits nobody, the next plan
+        # has the same shape, and the queue grows while the GPU sits at 0%.
+        # Measured across fourteen of thirty-one experiments -- `parrot` on 98.9%
+        # of its steps, `preble` 88.1%, `agentix` 87.7% -- and it is why four
+        # arms had to be killed at their bound.
+        if rankable == 0:
+            native = self._select_waiting_queue_for_scheduling()
+            if native is not None:
+                self._plex_choice["waiting_declined_native"] += 1
+                return native, native.peek_request()
+        return None
 
     @staticmethod
     def _remove_waiting_request(request_queue: RequestQueue, request: Request) -> None:
