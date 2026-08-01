@@ -2376,19 +2376,46 @@ class Scheduler(SchedulerInterface):
         preferred = False
         unseen: tuple[RequestQueue, Request] | None = None
         self._plex_choice["waiting_calls"] += 1
+        # The plan ranks at most the working set -- 256 requests -- so once every
+        # id it ranked has been found in the queue, no request further down can
+        # lower the minimum and the scan is finished. Where the plan ranks
+        # nothing, the only thing left to find is the first request it never saw,
+        # and that is an early exit too.
+        #
+        # Without these the scan is O(queue) on every scheduler step, and the
+        # engine's own path only peeks at the head. It cost four arms a
+        # measurement: `saga` at a 3,074-request load spent 56 minutes of CPU at
+        # 155% of a core with the GPU at 0%, scanning thousands of queued
+        # requests tens of thousands of times, and was killed at the bound and
+        # reported as a device limit. Completed arms scan 25-174 per step;
+        # `preble` already reached 19.4 million scans over 163,365 steps.
+        rankable = len(set(plex_plan.ranks) | set(plex_plan.preference))
+        found = 0
         for request_queue in (self.waiting, self.skipped_waiting):
             for request in request_queue:
                 rank = plex_plan.rank(request.request_id)
                 self._plex_choice["waiting_scanned_sum"] += 1
-                if plex_plan.saw(request.request_id):
+                seen = plex_plan.saw(request.request_id)
+                if seen:
                     self._plex_choice["waiting_seen_sum"] += 1
                 if rank is not None:
                     self._plex_choice["waiting_ranked_sum"] += 1
+                    found += 1
                 if rank is not None and (selected is None or rank < selected[0]):
                     selected = (rank, request_queue, request)
                     preferred = plex_plan.prefers(request.request_id)
-                if unseen is None and not plex_plan.saw(request.request_id):
+                if unseen is None and not seen:
                     unseen = (request_queue, request)
+                # Every ranked id accounted for: nothing below can win.
+                if rankable and found >= rankable:
+                    break
+                # Nothing is rankable, so `unseen` is the only outcome the rest
+                # of this scan could produce, and it is already decided.
+                if not rankable and unseen is not None:
+                    break
+            else:
+                continue
+            break
         if selected is None and unseen is None:
             # Every queued request was in the plan and none was selected, so the
             # waiting loop breaks and this step admits nobody.
