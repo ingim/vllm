@@ -167,6 +167,15 @@ class EngrainBackend(StructuredOutputBackend):
         self.table_budget_bytes = int(
             os.environ.get("ENGRAIN_TABLE_BUDGET_MB", "1024")
         ) * (1 << 20)
+        # Digits an unbounded number may run to. Off by default, because it
+        # narrows the language the schema asks for and this engine will not do
+        # that on its own. It is here because a model handed a mask that still
+        # admits a digit emits one: on a schema whose last property is an
+        # unbounded integer, 71.9% of requests ran to the token limit
+        # mid-number - and XGrammar's 70.8% on the same schema says that is the
+        # language's doing, not either engine's.
+        digits = os.environ.get("ENGRAIN_MAX_DIGITS")
+        self.max_digits = int(digits) if digits else None
         self.batch: object = None
         self.max_num_seqs = max(
             8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
@@ -359,9 +368,13 @@ class EngrainBackend(StructuredOutputBackend):
 
     def _compile(self, request_type: StructuredOutputOptions, grammar_spec: str):
         if request_type == StructuredOutputOptions.JSON:
-            return self.compiler.compile_json_schema(grammar_spec)
+            return self.compiler.compile_json_schema(
+                grammar_spec, max_digits=self.max_digits
+            )
         if request_type == StructuredOutputOptions.JSON_OBJECT:
-            return self.compiler.compile_json_schema(json.dumps({"type": "object"}))
+            return self.compiler.compile_json_schema(
+                json.dumps({"type": "object"}), max_digits=self.max_digits
+            )
         if request_type == StructuredOutputOptions.REGEX:
             return self.compiler.compile_regex(grammar_spec)
         if request_type == StructuredOutputOptions.GRAMMAR:
