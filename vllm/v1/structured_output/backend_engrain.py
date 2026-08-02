@@ -32,6 +32,10 @@ from vllm.v1.structured_output.backend_types import (
 
 logger = init_logger(__name__)
 
+# Rollback slots per matcher. Enough for the longest draft a speculative
+# decoder proposes; the state it keeps is one snapshot per slot.
+_MATCHER_ROLLBACK = 32
+
 
 def _vocabulary(tokenizer) -> list[bytes]:
     """The tokenizer's byte strings, indexed by token id."""
@@ -63,13 +67,12 @@ class EngrainGrammar(StructuredOutputGrammar):
     _processed: int = field(default=0, repr=False)
     _pinned: bool = field(default=False, repr=False)
 
-    def __post_init__(self) -> None:
-        # A request holds its grammar in the pool for as long as it runs. The
-        # eviction policy only ever takes grammars nothing is running under, so
-        # this is what makes a budget safe rather than a source of wrong masks.
-        if self.device is not None:
-            self.device.pin(self.grammar_id)
-            self._pinned = True
+    # A request holds its grammar in the pool for as long as it runs, and the
+    # eviction policy only ever takes grammars nothing is running under - which
+    # is what makes a budget safe rather than a source of wrong masks. The pin
+    # is taken by the backend under the lock that resolved the identifier, not
+    # here, because everything between the two is a window in which the pool can
+    # evict what this request is about to depend on.
 
     def __del__(self) -> None:
         # vLLM gives a backend no "request finished" hook, so the request's own
@@ -181,6 +184,7 @@ class EngrainBackend(StructuredOutputBackend):
         self.max_digits = int(digits) if digits else None
         self.batch: object = None
         self._warned_about_ceiling = False
+        self._warned_about_narrowing = False
         self.max_num_seqs = max(
             8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
         )
@@ -235,6 +239,16 @@ class EngrainBackend(StructuredOutputBackend):
                     identifier = self.pool.admit(compiled)
                     self.grammar_ids[key] = (identifier, self.pool.generation(identifier))
                 identifier, generation = self.grammar_ids[key]
+                # Pinned here, under the lock that resolved it, rather than in
+                # the grammar's constructor outside it. vLLM compiles on a
+                # thread pool, so between admitting a grammar and pinning it
+                # another request could admit one, evict this brand-new and
+                # still unpinned grammar, and leave the request that asked for
+                # it holding an identifier the pool no longer has - which is
+                # exactly "grammar ids no longer in the pool: [33]", and only a
+                # workload of hundreds of distinct schemas under a budget gets
+                # near enough to the ceiling to show it.
+                self.pool.pin(identifier)
             pool = self.pool
         if pool is not None:
             # Compiling happens when a request is admitted, which is before any
@@ -243,12 +257,17 @@ class EngrainBackend(StructuredOutputBackend):
             # and vLLM would rightly call it a latency spike.
             self._batch_for(self.max_num_seqs)
         return EngrainGrammar(
-            matcher=compiled.matcher(32),
+            # How many steps the matcher can roll back, which is what
+            # speculative decoding needs and nothing else does. Not a
+            # configuration ceiling - that one is `ENGRAIN_MAX_CONFIGS` and is
+            # shared with the device.
+            matcher=compiled.matcher(_MATCHER_ROLLBACK),
             words=compiled.bitset_words,
             stop_token_ids=self.stop_token_ids,
             device=pool,
             grammar_id=identifier,
             generation=generation,
+            _pinned=pool is not None,
         )
 
     def fill_bitmasks(
@@ -285,17 +304,7 @@ class EngrainBackend(StructuredOutputBackend):
         # matcher, which is exact and merely slower. Found by a workload of 425
         # real schemas, where one needs a stack of 257 against the pool's 256.
         try:
-            with self.lock:
-                device = self._batch_for(len(rows))
-                device.set_grammars(
-                    [grammar.grammar_id for grammar, _ in rows]
-                    + [0] * (device.batch - len(rows))
-                )
-                # The matchers go straight to the packer rather than through a
-                # dict of Python configuration lists: at batch 512 that is
-                # 352 us against 1,373.
-                device.set_matchers([grammar.matcher for grammar, _ in rows])
-                host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+            host, narrowed = self._fill(rows)
         except ValueError as refusal:
             if not self._warned_about_ceiling:
                 logger.warning(
@@ -322,14 +331,7 @@ class EngrainBackend(StructuredOutputBackend):
             if not shallow:
                 return
             rows = shallow
-            with self.lock:
-                device = self._batch_for(len(rows))
-                device.set_grammars(
-                    [grammar.grammar_id for grammar, _ in rows]
-                    + [0] * (device.batch - len(rows))
-                )
-                device.set_matchers([grammar.matcher for grammar, _ in rows])
-                host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+            host, narrowed = self._fill(rows)
 
         # One vectorised copy, not a Python loop over rows. Profiled at batch
         # 256 the loop was 2,289 us of a 2,913 us step - 79% of everything the
@@ -345,10 +347,48 @@ class EngrainBackend(StructuredOutputBackend):
         # loop - but it writes one word rather than copying a row.
         for grammar, index in rows:
             grammar._allow_stops(bitmask[index])
+        # A row the device says it narrowed is filled again from the matcher,
+        # which has no ceiling of that kind. Narrowing is the safe direction and
+        # still the wrong answer: it forbids what the grammar allows, and the
+        # model cannot route around a token that is not in the mask.
+        if narrowed.any():
+            for row, (grammar, index) in enumerate(rows):
+                if narrowed[row]:
+                    grammar.fill_bitmask(bitmask, index)
+            self._warn_narrowed(int(narrowed.sum()))
         if os.environ.get("ENGRAIN_VERIFY"):
-            self._verify(rows, host)
+            self._verify(rows, host, narrowed)
 
-    def _verify(self, rows, host) -> None:
+    def _fill(self, rows):
+        """The device fill, and what it says about its own answer.
+
+        Returns the mask rows on the host and, beside them, which of those rows
+        the engine flagged as narrowed. Both come back on the copy the mask
+        already makes, so reading the flags costs no extra synchronisation.
+        """
+        with self.lock:
+            device = self._batch_for(len(rows))
+            device.set_grammars(self._ids(rows, device.batch))
+            # The matchers go straight to the packer rather than through a dict
+            # of Python configuration lists: at batch 512 that is 352 us
+            # against 1,373.
+            device.set_matchers([grammar.matcher for grammar, _ in rows])
+            host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+            _, flags = device.problems()
+            return host, flags[: len(rows)].to("cpu", non_blocking=False).bool()
+
+    def _warn_narrowed(self, count: int) -> None:
+        if self._warned_about_narrowing:
+            return
+        self._warned_about_narrowing = True
+        logger.warning(
+            "engrain: %d row(s) met a ceiling mid-parse and were given a "
+            "narrowed mask. Those rows fall back to the reference matcher, so "
+            "the mask is exact; the cost is that they leave the device.",
+            count,
+        )
+
+    def _verify(self, rows, host, narrowed) -> None:
         """Compare what the device produced against the matcher, row by row.
 
         Only for finding out where a serving-path disagreement comes from; it is
@@ -356,6 +396,11 @@ class EngrainBackend(StructuredOutputBackend):
         """
         reference = torch.zeros(host.shape[1], dtype=torch.int32)
         for row, (grammar, index) in enumerate(rows):
+            # A narrowed row does not reach the sampler - it is refilled from
+            # the matcher - so comparing the device's answer for it would report
+            # a disagreement the caller never sees.
+            if narrowed[row]:
+                continue
             reference.zero_()
             grammar.matcher.fill_bitmask(reference)
             if not torch.equal(host[row], reference):
@@ -394,6 +439,20 @@ class EngrainBackend(StructuredOutputBackend):
                     flush=True,
                 )
                 raise SystemExit(3)
+
+    def _ids(self, rows, batch: int) -> list[int]:
+        """The grammar id of every row, padded to the batch's width.
+
+        The padding rows carry no matcher and produce nothing, but they still
+        name a slot - and a slot that names a grammar the pool has evicted is
+        refused, which would kill the step over rows nobody asked about. The
+        first row's id is live by construction: its request pinned it. Padding
+        with the literal 0 is what a workload of hundreds of distinct schemas
+        under a table budget eventually breaks, because grammar 0 is simply the
+        oldest and the first to be evicted.
+        """
+        ids = [grammar.grammar_id for grammar, _ in rows]
+        return ids + [ids[0]] * (batch - len(ids))
 
     def _batch_for(self, size: int):
         """A device batch big enough for `size` sequences, reused across steps.
