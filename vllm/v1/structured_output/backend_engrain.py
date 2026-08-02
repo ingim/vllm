@@ -23,11 +23,14 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
     StructuredOutputOptions,
 )
+
+logger = init_logger(__name__)
 
 
 def _vocabulary(tokenizer) -> list[bytes]:
@@ -177,6 +180,7 @@ class EngrainBackend(StructuredOutputBackend):
         digits = os.environ.get("ENGRAIN_MAX_DIGITS")
         self.max_digits = int(digits) if digits else None
         self.batch: object = None
+        self._warned_about_ceiling = False
         self.max_num_seqs = max(
             8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
         )
@@ -274,21 +278,59 @@ class EngrainBackend(StructuredOutputBackend):
         # not be admitted into between choosing the batch and launching against
         # it. Uncontended in steady state - admission happens when a request
         # arrives, not when a token is sampled.
-        with self.lock:
-            device = self._batch_for(len(rows))
-            device.set_grammars(
-                [grammar.grammar_id for grammar, _ in rows]
-                + [0] * (device.batch - len(rows))
-            )
-            # The matchers go straight to the packer rather than through a dict
-            # of Python configuration lists: at batch 512 that is 352 us
-            # against 1,373.
-            device.set_matchers([grammar.matcher for grammar, _ in rows])
-            host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
-        # vLLM's bitmask spans the model's padded vocabulary and ours spans the
-        # tokenizer's, so the rows differ in width. The tail is padding rather
-        # than tokens, and a row is written wholesale, so it has to be cleared
-        # or the padding would be left allowed from whatever was there before.
+        # A ceiling can be met at *run* time rather than at admission: the
+        # stack a parse actually reaches is a property of the document, and the
+        # pool's depth is fixed when it is built. Meeting one must degrade
+        # rather than kill the step, so the rows fall back to the reference
+        # matcher, which is exact and merely slower. Found by a workload of 425
+        # real schemas, where one needs a stack of 257 against the pool's 256.
+        try:
+            with self.lock:
+                device = self._batch_for(len(rows))
+                device.set_grammars(
+                    [grammar.grammar_id for grammar, _ in rows]
+                    + [0] * (device.batch - len(rows))
+                )
+                # The matchers go straight to the packer rather than through a
+                # dict of Python configuration lists: at batch 512 that is
+                # 352 us against 1,373.
+                device.set_matchers([grammar.matcher for grammar, _ in rows])
+                host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+        except ValueError as refusal:
+            if not self._warned_about_ceiling:
+                logger.warning(
+                    "engrain: %s. The rows past the ceiling fall back to the "
+                    "reference matcher; the rest stay on the device. The mask "
+                    "is the same either way.",
+                    refusal,
+                )
+                self._warned_about_ceiling = True
+            # Only the rows that actually exceed it. Sending the whole step to
+            # the host because one request nests deeply would let a single
+            # document decide how every other one is served.
+            limit = self.batch.grammar.max_stack if self.batch is not None else 0
+            deep = []
+            shallow = []
+            for grammar, index in rows:
+                depth = max(
+                    (len(stack) for _, stack in grammar.matcher.configurations()),
+                    default=0,
+                )
+                (deep if depth > limit else shallow).append((grammar, index))
+            for grammar, index in deep:
+                grammar.fill_bitmask(bitmask, index)
+            if not shallow:
+                return
+            rows = shallow
+            with self.lock:
+                device = self._batch_for(len(rows))
+                device.set_grammars(
+                    [grammar.grammar_id for grammar, _ in rows]
+                    + [0] * (device.batch - len(rows))
+                )
+                device.set_matchers([grammar.matcher for grammar, _ in rows])
+                host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+
         # One vectorised copy, not a Python loop over rows. Profiled at batch
         # 256 the loop was 2,289 us of a 2,913 us step - 79% of everything the
         # backend spent, against 33 us for the fill it exists to deliver. The
