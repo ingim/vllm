@@ -840,7 +840,28 @@ class VllmEnginePort:
         # what `residents()` can offer -- preempted and locally-freed requests
         # appear in it and are not rankable -- so an inflated census can no
         # longer drive the budget to zero.
-        wanted = min(len(census), max(len(residents) - 1, 0))
+        # Demand a ranking over everything offered, not over what happens to be
+        # free right now.
+        #
+        # `census` is the free-but-cached set at this instant, and capping the
+        # demand by it was meant to stop an inflated census driving the budget
+        # to zero. Measured on `peek` at its calibrated load it does the
+        # opposite: 42 residents offered per ask, **2.9** demanded, because only
+        # 2.9 owners were unreferenced at that moment -- while the engine evicts
+        # **680 blocks/s** and the policy's round trip is 164 ms, so **112
+        # blocks leave inside one answer's lifetime**. Three owners' worth of
+        # order against 112 evictions is a 7.1% share, and that is the number
+        # measured.
+        #
+        # The blocks evicted in that window mostly belong to requests that were
+        # still running when the ask went out. A policy cannot rank what it was
+        # not offered, but it *can* rank a resident that is not evictable yet --
+        # and `_plex_take` walks the order and takes only what it needs, so a
+        # longer ranking evicts no more, it just keeps deciding for longer.
+        #
+        # Still capped at `len(residents) - 1` so one unit of headroom survives
+        # and the retained-bytes equation stays satisfiable.
+        wanted = max(len(residents) - 1, 0)
         self._plex_ask_calls += 1
         self._plex_wanted_sum += wanted
         self._plex_offered_sum += len(residents)
