@@ -289,10 +289,19 @@ class EngrainBackend(StructuredOutputBackend):
         # tokenizer's, so the rows differ in width. The tail is padding rather
         # than tokens, and a row is written wholesale, so it has to be cleared
         # or the padding would be left allowed from whatever was there before.
+        # One vectorised copy, not a Python loop over rows. Profiled at batch
+        # 256 the loop was 2,289 us of a 2,913 us step - 79% of everything the
+        # backend spent, against 33 us for the fill it exists to deliver. The
+        # destination rows are scattered, so the copy is an index_copy_ rather
+        # than a slice assignment.
         width = host.shape[1]
-        for row, (grammar, index) in enumerate(rows):
-            bitmask[index, :width].copy_(host[row])
-            bitmask[index, width:].zero_()
+        where = torch.tensor([index for _, index in rows], dtype=torch.long)
+        bitmask[:, :width].index_copy_(0, where, host)
+        if bitmask.shape[1] > width:
+            bitmask[:, width:].index_fill_(0, where, 0)
+        # The stop token is per row and depends on the matcher, so it stays a
+        # loop - but it writes one word rather than copying a row.
+        for grammar, index in rows:
             grammar._allow_stops(bitmask[index])
         if os.environ.get("ENGRAIN_VERIFY"):
             self._verify(rows, host)
