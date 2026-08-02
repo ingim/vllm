@@ -189,6 +189,22 @@ class VllmRequest:
             "current_queue_ms": 0 if running else waiting_ms,
             "kv_overloaded": under_pressure(self._scheduler),
             "now_ms": int(time.time() * 1000),
+            # The engine's own clock, in scheduler steps.
+            #
+            # `helium` reads it to decide whether a request's precedence
+            # constraint has come due -- `precedence_ready_at <= now_token_step`
+            # -- and nothing produced it, so `unwrap_or(0)` pinned the clock at
+            # zero and no request was ever ready except one due at step 0. The
+            # policy then fell to its forced branch, which picks by cursor
+            # order, which is arrival order: 4(b) read **0.00%** on BFCL over
+            # 6,871 picks and **0.08%** on swebench, and both looked like a
+            # critical-path scheduler agreeing with FCFS.
+            #
+            # The scheduler has counted this since the channel was opened. It
+            # was never published.
+            "now_token_step": getattr(self._scheduler, "_plex_choice", {}).get(
+                "steps", 0
+            ),
         }
 
     def cache_facts(self) -> dict[str, Any]:
