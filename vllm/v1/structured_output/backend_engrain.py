@@ -145,9 +145,9 @@ class EngrainGrammar(StructuredOutputGrammar):
 @dataclass
 class EngrainBackend(StructuredOutputBackend):
     def __post_init__(self) -> None:
-        import engrain
+        import engrain.internals
 
-        self.compiler = engrain.Compiler(_vocabulary(self.tokenizer))
+        self.compiler = engrain.internals.Compiler(_vocabulary(self.tokenizer))
         self.stop_token_ids = [
             token
             for token in [getattr(self.tokenizer, "eos_token_id", None)]
