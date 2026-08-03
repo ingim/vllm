@@ -186,6 +186,7 @@ class EngrainBackend(StructuredOutputBackend):
         self.batch: object = None
         self._warned_about_ceiling = False
         self._warned_about_narrowing = False
+        self._assigned: list[int] | None = None
         self._phases: dict[str, list] = {}
         if os.environ.get("ENGRAIN_TIMING"):
             import atexit
@@ -464,13 +465,28 @@ class EngrainBackend(StructuredOutputBackend):
         with self.lock:
             started = time.perf_counter()
             device = self._batch_for(len(rows))
-            device.set_grammars(self._ids(rows, device.batch))
+            sized = time.perf_counter()
+            self._phase("batch_for", sized - started)
+            # Only when the assignment has actually changed. `set_grammars`
+            # resets the whole batch to each grammar's start state - depth,
+            # counts, lexer states, flags, one stack entry per configuration -
+            # and `set_matchers` overwrites all of it a line later with the
+            # state the request is really in. At batch 512 with a deep stack
+            # that reset was 3,282 us a step against 421 for the load. The
+            # assignment changes when requests join or leave, which is rare
+            # next to how often a token is sampled.
+            wanted = self._ids(rows, device.batch)
+            if wanted != self._assigned:
+                device.set_grammars(wanted)
+                self._assigned = wanted
+            named = time.perf_counter()
+            self._phase("set_grammars", named - sized)
             # The matchers go straight to the packer rather than through a dict
             # of Python configuration lists: at batch 512 that is 352 us
             # against 1,373.
             device.set_matchers([grammar.matcher for grammar, _ in rows])
             seeded = time.perf_counter()
-            self._phase("seed", seeded - started)
+            self._phase("set_matchers", seeded - named)
             mask = device.fill_mask()
             filled = time.perf_counter()
             self._phase("fill launch", filled - seeded)
@@ -575,6 +591,8 @@ class EngrainBackend(StructuredOutputBackend):
             )
             if self.batch is None or self.batch.batch < size or stale:
                 self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
+                # A new batch has been told nothing.
+                self._assigned = None
                 # Triton compiles on first use, and first use would otherwise
                 # be in the middle of a step.
                 self.batch.warmup()
