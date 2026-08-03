@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 import torch
 
 from vllm.logger import init_logger
+from engrain.internals import StackTooDeep
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -314,7 +315,7 @@ class EngrainBackend(StructuredOutputBackend):
         # for the fill. So the ceiling is raised once instead, and degrading is
         # what happens only when it cannot be.
         try:
-            host, narrowed = self._fill(rows)
+            host, narrowed = self._grow_or_fill(rows)
         except ValueError as refusal:
             import time
 
@@ -411,6 +412,45 @@ class EngrainBackend(StructuredOutputBackend):
                 f"   ({count} calls, {total:.2f} s total)",
                 flush=True,
             )
+
+    # Past this a parse is a runaway rather than a document, and the buffers
+    # are `batch x configurations x depth`: at batch 512 and 128 configurations
+    # every 256 of depth is 67 MB.
+    _STACK_CEILING = 2048
+
+    def _grow_or_fill(self, rows):
+        """Fill, and if the batch is too shallow for the parse, deepen it once.
+
+        The depth a parse reaches is a property of the document, so it cannot be
+        settled when the pool is built. Degrading the offending rows to the
+        reference matcher is exact but ruinous - measured at 4,577 us a step for
+        three rows, because a host fill on a deep stack is ~1.5 ms - and it
+        never stops, since the document keeps growing. Growing is once.
+
+        Doubling rather than meeting the request: a document that passed the
+        ceiling once will pass it again a token later, and each growth rebuilds
+        the batch's buffers and re-records its graphs.
+        """
+        try:
+            return self._fill(rows)
+        except StackTooDeep as refusal:
+            with self.lock:
+                wanted = min(self._STACK_CEILING, max(refusal.needed * 2, 512))
+                if self.pool is None or wanted <= self.pool.max_stack:
+                    raise
+                logger.warning(
+                    "engrain: a parse reached a stack of %d against the "
+                    "batch's %d; rebuilding it %d deep. The rows stay on the "
+                    "device, which is the point: sending them to the host "
+                    "matcher instead costs about 1.5 ms each, every step, for "
+                    "as long as the document keeps growing.",
+                    refusal.needed,
+                    self.pool.max_stack,
+                    wanted,
+                )
+                self.pool.max_stack = wanted
+                self.batch = None
+            return self._fill(rows)
 
     def _fill(self, rows):
         """The device fill, and what it says about its own answer.
