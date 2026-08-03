@@ -185,6 +185,11 @@ class EngrainBackend(StructuredOutputBackend):
         self.batch: object = None
         self._warned_about_ceiling = False
         self._warned_about_narrowing = False
+        self._phases: dict[str, list] = {}
+        if os.environ.get("ENGRAIN_TIMING"):
+            import atexit
+
+            atexit.register(self._report_phases)
         self.max_num_seqs = max(
             8, getattr(self.vllm_config.scheduler_config, "max_num_seqs", 8)
         )
@@ -272,7 +277,7 @@ class EngrainBackend(StructuredOutputBackend):
 
     def fill_bitmasks(
         self, batch: list[tuple[StructuredOutputGrammar, int]], bitmask: torch.Tensor
-    ) -> None:
+    ) -> None:  # noqa: D401
         """Fill every row of this step in one launch.
 
         The tables of every schema live in one arena and a sequence carries the
@@ -298,14 +303,22 @@ class EngrainBackend(StructuredOutputBackend):
         # it. Uncontended in steady state - admission happens when a request
         # arrives, not when a token is sampled.
         # A ceiling can be met at *run* time rather than at admission: the
-        # stack a parse actually reaches is a property of the document, and the
-        # pool's depth is fixed when it is built. Meeting one must degrade
-        # rather than kill the step, so the rows fall back to the reference
-        # matcher, which is exact and merely slower. Found by a workload of 425
-        # real schemas, where one needs a stack of 257 against the pool's 256.
+        # stack a parse reaches is a property of the document, and a schema
+        # with an unbounded array reaches any depth given a long enough one.
+        # The first answer to that was to degrade the offending rows to the
+        # reference matcher, which is exact - but the depth was found by
+        # rescanning every row's configurations in Python, every step, because
+        # the document keeps growing and the ceiling stays met. At batch 512 on
+        # a schema with an unbounded array that was 4,981 us per step across
+        # 64% of the steps: 58% of everything the backend spent, against 119 us
+        # for the fill. So the ceiling is raised once instead, and degrading is
+        # what happens only when it cannot be.
         try:
             host, narrowed = self._fill(rows)
         except ValueError as refusal:
+            import time
+
+            degraded = time.perf_counter()
             if not self._warned_about_ceiling:
                 logger.warning(
                     "engrain: %s. The rows past the ceiling fall back to the "
@@ -321,13 +334,23 @@ class EngrainBackend(StructuredOutputBackend):
             deep = []
             shallow = []
             for grammar, index in rows:
-                depth = max(
-                    (len(stack) for _, stack in grammar.matcher.configurations()),
-                    default=0,
-                )
-                (deep if depth > limit else shallow).append((grammar, index))
+                # `max_stack_depth` rather than a max over `configurations`.
+                # The latter clones every stack of every row into Python to read
+                # one integer from each, and this scan runs on every step for as
+                # long as the document keeps growing - at batch 512 on a schema
+                # with an unbounded array it was 4,981 us per step across 64% of
+                # the steps, 58% of everything the backend spent against 119 us
+                # for the fill it was protecting.
+                if grammar.matcher.max_stack_depth() > limit:
+                    deep.append((grammar, index))
+                else:
+                    shallow.append((grammar, index))
+            self._phase("ceiling rescan", time.perf_counter() - degraded)
+            fell_back = time.perf_counter()
             for grammar, index in deep:
                 grammar.fill_bitmask(bitmask, index)
+            self._phase("host fallback", time.perf_counter() - fell_back)
+            self._phase("rows on the host", len(deep) / 1e6)
             if not shallow:
                 return
             rows = shallow
@@ -338,6 +361,9 @@ class EngrainBackend(StructuredOutputBackend):
         # backend spent, against 33 us for the fill it exists to deliver. The
         # destination rows are scattered, so the copy is an index_copy_ rather
         # than a slice assignment.
+        import time
+
+        started = time.perf_counter()
         width = host.shape[1]
         where = torch.tensor([index for _, index in rows], dtype=torch.long)
         bitmask[:, :width].index_copy_(0, where, host)
@@ -347,6 +373,7 @@ class EngrainBackend(StructuredOutputBackend):
         # loop - but it writes one word rather than copying a row.
         for grammar, index in rows:
             grammar._allow_stops(bitmask[index])
+        self._phase("copy out", time.perf_counter() - started)
         # A row the device says it narrowed is filled again from the matcher,
         # which has no ceiling of that kind. Narrowing is the safe direction and
         # still the wrong answer: it forbids what the grammar allows, and the
@@ -359,6 +386,32 @@ class EngrainBackend(StructuredOutputBackend):
         if os.environ.get("ENGRAIN_VERIFY"):
             self._verify(rows, host, narrowed)
 
+    def _phase(self, name: str, elapsed: float) -> None:
+        """Accumulate where a step goes, when asked. Off by default.
+
+        A device fill that a host mask has to be read back from puts a
+        synchronisation in the middle of a decode loop, and a synchronisation
+        waits for everything already queued - including the model's forward.
+        That does not show in a kernel timing, only here.
+        """
+        held = self._phases.setdefault(name, [0.0, 0])
+        held[0] += elapsed
+        held[1] += 1
+
+    def _report_phases(self) -> None:
+        if not self._phases:
+            return
+        steps = max(count for _, count in self._phases.values())
+        print(f"ENGRAIN {steps} steps, per step:", flush=True)
+        for name, (total, count) in sorted(
+            self._phases.items(), key=lambda item: -item[1][0]
+        ):
+            print(
+                f"ENGRAIN   {name:<16} {total / max(steps, 1) * 1e6:9.1f} us"
+                f"   ({count} calls, {total:.2f} s total)",
+                flush=True,
+            )
+
     def _fill(self, rows):
         """The device fill, and what it says about its own answer.
 
@@ -366,16 +419,28 @@ class EngrainBackend(StructuredOutputBackend):
         the engine flagged as narrowed. Both come back on the copy the mask
         already makes, so reading the flags costs no extra synchronisation.
         """
+        import time
+
         with self.lock:
+            started = time.perf_counter()
             device = self._batch_for(len(rows))
             device.set_grammars(self._ids(rows, device.batch))
             # The matchers go straight to the packer rather than through a dict
             # of Python configuration lists: at batch 512 that is 352 us
             # against 1,373.
             device.set_matchers([grammar.matcher for grammar, _ in rows])
-            host = device.fill_mask()[: len(rows)].to("cpu", non_blocking=False)
+            seeded = time.perf_counter()
+            self._phase("seed", seeded - started)
+            mask = device.fill_mask()
+            filled = time.perf_counter()
+            self._phase("fill launch", filled - seeded)
+            host = mask[: len(rows)].to("cpu", non_blocking=False)
+            copied = time.perf_counter()
+            self._phase("mask to host", copied - filled)
             _, flags = device.problems()
-            return host, flags[: len(rows)].to("cpu", non_blocking=False).bool()
+            narrowed = flags[: len(rows)].to("cpu", non_blocking=False).bool()
+            self._phase("flags to host", time.perf_counter() - copied)
+            return host, narrowed
 
     def _warn_narrowed(self, count: int) -> None:
         if self._warned_about_narrowing:
