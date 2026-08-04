@@ -25,6 +25,7 @@ import torch
 
 from vllm.logger import init_logger
 from engrain.internals import StackTooDeep
+from engrain.internals import WindowTooWide
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -192,10 +193,27 @@ class EngrainBackend(StructuredOutputBackend):
         self.max_string = int(length) if length else None
         space = os.environ.get("ENGRAIN_MAX_WHITESPACE")
         self.max_whitespace = int(space) if space else None
+        # The replay window a grammar may want before it is kept on the host
+        # instead. `cand_window` is `batch x configurations x readings x window`
+        # and 95% of a batch's memory, and the window is the only factor in it
+        # that one schema can raise for every row: over 116 corpus schemas it
+        # is 20 at the median and 32 at the p90, then 349.
+        #
+        # Off by default, because it was measured and it is a bad trade.
+        # Capping at the p90 takes a batch of 512 from 8.40 GiB to 1.32 and
+        # sends the other tenth of schemas to the reference matcher - which
+        # costs about 1.5 ms per row per step, so end to end over 409 corpus
+        # schemas it is 9,050 tok/s against 2,503. Seven gigabytes for 3.6x of
+        # the throughput is not a trade worth making by default; the memory
+        # has to come from sizing the window by what candidates need rather
+        # than from evicting the schemas that need it.
+        window = os.environ.get("ENGRAIN_WINDOW_CAP")
+        self.window_cap = int(window) if window and window != "0" else None
         self.batch: object = None
         self._warned_about_ceiling = False
         self._warned_about_narrowing = False
         self._warned_about_bounds = False
+        self._warned_about_window = False
         self._assigned: list[int] | None = None
         self._phases: dict[str, list] = {}
         if os.environ.get("ENGRAIN_TIMING"):
@@ -244,7 +262,8 @@ class EngrainBackend(StructuredOutputBackend):
             if self.device_parser is not None:
                 if self.pool is None:
                     self.pool = self.device_parser.DeviceGrammar(
-                        budget_bytes=self.table_budget_bytes
+                        budget_bytes=self.table_budget_bytes,
+                        window_cap=self.window_cap,
                     )
                 held = self.grammar_ids.get(key)
                 # The cache outlives the pool's memory: a schema no request was
@@ -253,7 +272,28 @@ class EngrainBackend(StructuredOutputBackend):
                 # not a recompile, which is why the artifact is worth keeping
                 # even when the tables are not.
                 if held is None or not self.pool.holds(*held):
-                    identifier = self.pool.admit(compiled)
+                    try:
+                        identifier = self.pool.admit(compiled)
+                    except WindowTooWide as refusal:
+                        # This grammar would size every row of every batch for
+                        # itself - the replay window is 95% of a batch's memory
+                        # and one schema in ten costs the rest an eightfold
+                        # buffer. It runs on the reference matcher instead:
+                        # exact, slower for this request, and not larger for
+                        # everyone else's.
+                        if not self._warned_about_window:
+                            self._warned_about_window = True
+                            logger.warning(
+                                "engrain: %s. That schema stays on the "
+                                "reference matcher; the rest of the batch "
+                                "keeps the smaller buffers.",
+                                refusal,
+                            )
+                        return EngrainGrammar(
+                            matcher=compiled.matcher(_MATCHER_ROLLBACK),
+                            words=compiled.bitset_words,
+                            stop_token_ids=self.stop_token_ids,
+                        )
                     self.grammar_ids[key] = (identifier, self.pool.generation(identifier))
                 identifier, generation = self.grammar_ids[key]
                 # Pinned here, under the lock that resolved it, rather than in
