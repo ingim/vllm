@@ -183,9 +183,19 @@ class EngrainBackend(StructuredOutputBackend):
         # language's doing, not either engine's.
         digits = os.environ.get("ENGRAIN_MAX_DIGITS")
         self.max_digits = int(digits) if digits else None
+        # The same argument for the other two unbounded constructs. Of 32
+        # requests that ran to the token limit on a corpus of real schemas, 19
+        # were inside a string and 13 between tokens - `{"xi":  \n\n\n` for two
+        # hundred tokens, a position where the model has not decided and
+        # whitespace is admitted, then admitted again.
+        length = os.environ.get("ENGRAIN_MAX_STRING")
+        self.max_string = int(length) if length else None
+        space = os.environ.get("ENGRAIN_MAX_WHITESPACE")
+        self.max_whitespace = int(space) if space else None
         self.batch: object = None
         self._warned_about_ceiling = False
         self._warned_about_narrowing = False
+        self._warned_about_bounds = False
         self._assigned: list[int] | None = None
         self._phases: dict[str, list] = {}
         if os.environ.get("ENGRAIN_TIMING"):
@@ -599,14 +609,42 @@ class EngrainBackend(StructuredOutputBackend):
             self.batch.config_count.fill_(1)
             return self.batch
 
+    def _bounded(self, schema: str):
+        """Compile with the caller's bounds, and without them if they do not fit.
+
+        A bound is an optimisation - it stops a model running to the token
+        limit inside a construct JSON leaves open - and an optimisation that
+        makes a schema uncompilable is worse than one that is skipped. Bounding
+        whitespace turns a star into a counted automaton, which costs lexer
+        states, and one corpus schema in 409 goes past the budget for it.
+        """
+        try:
+            return self.compiler.compile_json_schema(
+                schema,
+                max_digits=self.max_digits,
+                max_string=self.max_string,
+                max_whitespace=self.max_whitespace,
+            )
+        except Exception:  # noqa: BLE001
+            if self.max_string is None and self.max_whitespace is None:
+                raise
+            if not self._warned_about_bounds:
+                self._warned_about_bounds = True
+                logger.warning(
+                    "engrain: a schema does not fit with the string and "
+                    "whitespace bounds applied; compiling it without them. It "
+                    "keeps the schema at the cost of the runaway they prevent."
+                )
+            return self.compiler.compile_json_schema(
+                schema, max_digits=self.max_digits
+            )
+
     def _compile(self, request_type: StructuredOutputOptions, grammar_spec: str):
         if request_type == StructuredOutputOptions.JSON:
-            return self.compiler.compile_json_schema(
-                grammar_spec, max_digits=self.max_digits
-            )
+            return self._bounded(grammar_spec)
         if request_type == StructuredOutputOptions.JSON_OBJECT:
             return self.compiler.compile_json_schema(
-                json.dumps({"type": "object"}), max_digits=self.max_digits
+                json.dumps({"type": "object"})
             )
         if request_type == StructuredOutputOptions.REGEX:
             return self.compiler.compile_regex(grammar_spec)
