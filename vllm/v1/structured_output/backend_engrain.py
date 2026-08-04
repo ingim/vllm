@@ -220,6 +220,7 @@ class EngrainBackend(StructuredOutputBackend):
         self._warned_about_narrowing = False
         self._warned_about_bounds = False
         self._warned_about_window = False
+        self._announced = False
         self._assigned: list[int] | None = None
         self._phases: dict[str, list] = {}
         if os.environ.get("ENGRAIN_TIMING"):
@@ -675,7 +676,24 @@ class EngrainBackend(StructuredOutputBackend):
                 or self.batch.outgrown
             )
             if self.batch is None or self.batch.batch < size or stale:
-                self.batch = self.pool.new_batch(max(size, self.max_num_seqs))
+                width = max(size, self.max_num_seqs)
+                # Said before it is spent. Everything a batch allocates is a
+                # function of what the pool already knows, so an operator can
+                # be told the number rather than discover it in an allocation
+                # failure - which is the whole reason the ceilings grow on
+                # demand instead of being guessed high.
+                if not self._announced or self.batch is None:
+                    self._announced = True
+                    logger.info(
+                        "engrain: a batch of %d over %d configurations takes "
+                        "%.1f MiB of device memory, and the grammar tables "
+                        "another %.1f.",
+                        width,
+                        self.pool.max_configs,
+                        self.pool.footprint(width)["total"] / 2**20,
+                        self.pool.resident_bytes() / 2**20,
+                    )
+                self.batch = self.pool.new_batch(width)
                 # A new batch has been told nothing.
                 self._assigned = None
                 # Triton compiles on first use, and first use would otherwise
