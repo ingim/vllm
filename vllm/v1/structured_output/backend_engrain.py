@@ -25,7 +25,7 @@ import torch
 
 from vllm.logger import init_logger
 from engrain.internals import StackTooDeep
-from engrain.internals import WindowTooWide
+from engrain.internals import ConfigurationsExceeded, WindowTooWide
 from vllm.v1.structured_output.backend_types import (
     StructuredOutputBackend,
     StructuredOutputGrammar,
@@ -207,6 +207,12 @@ class EngrainBackend(StructuredOutputBackend):
         # the throughput is not a trade worth making by default; the memory
         # has to come from sizing the window by what candidates need rather
         # than from evicting the schemas that need it.
+        # Where the configuration ceiling starts. It grows when a parse wants
+        # more, so this is a floor rather than a guess: a row carries 2.5
+        # configurations at the mean over real schemas, and every array a batch
+        # holds is a multiple of this number.
+        start = os.environ.get("ENGRAIN_START_CONFIGS", "8")
+        self.start_configs = max(1, int(start))
         window = os.environ.get("ENGRAIN_WINDOW_CAP")
         self.window_cap = int(window) if window and window != "0" else None
         self.batch: object = None
@@ -264,6 +270,7 @@ class EngrainBackend(StructuredOutputBackend):
                     self.pool = self.device_parser.DeviceGrammar(
                         budget_bytes=self.table_budget_bytes,
                         window_cap=self.window_cap,
+                        max_configs=self.start_configs,
                     )
                 held = self.grammar_ids.get(key)
                 # The cache outlives the pool's memory: a schema no request was
@@ -464,6 +471,12 @@ class EngrainBackend(StructuredOutputBackend):
                 flush=True,
             )
 
+    # The configuration ceiling a pool may grow to. The reference matcher
+    # stops at 128 of its own, so past that the two would disagree about what
+    # they carry and the device would be the wider - which is the direction a
+    # mask may err in, and still not one to arrive at by accident.
+    _CONFIG_CEILING = 128
+
     # Past this a parse is a runaway rather than a document, and the buffers
     # are `batch x configurations x depth`: at batch 512 and 128 configurations
     # every 256 of depth is 67 MB.
@@ -483,6 +496,28 @@ class EngrainBackend(StructuredOutputBackend):
         the batch's buffers and re-records its graphs.
         """
         try:
+            return self._fill(rows)
+        except ConfigurationsExceeded as refusal:
+            # Every per-configuration array is `batch x configurations x
+            # something`, so this factor is the whole of what a batch costs:
+            # 443 MiB at batch 512 with a ceiling of 128, against a measured
+            # 2.5 configurations a row. Starting small and growing on demand
+            # pays for what a workload turns out to need instead of what one
+            # could imagine wanting.
+            with self.lock:
+                wanted = min(self._CONFIG_CEILING, max(refusal.needed * 2, 8))
+                if self.pool is None or wanted <= self.pool.max_configs:
+                    raise
+                logger.warning(
+                    "engrain: a parse carried %d configurations against the "
+                    "batch's %d; rebuilding it %d wide. This happens a few "
+                    "times as a workload reveals its widest schema.",
+                    refusal.needed,
+                    self.pool.max_configs,
+                    wanted,
+                )
+                self.pool.max_configs = wanted
+                self.batch = None
             return self._fill(rows)
         except StackTooDeep as refusal:
             with self.lock:
