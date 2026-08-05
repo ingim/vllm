@@ -69,6 +69,7 @@ class VllmRequest:
         "_cached_blocks",
         "_attained_service",
         "_child_count",
+        "_interior",
         "_pending_blocks",
     )
 
@@ -80,6 +81,7 @@ class VllmRequest:
         cached_blocks: int | None = None,
         attained_service: int | None = None,
         child_count: int = 0,
+        interior: bool = False,
         pending_blocks: int = 0,
     ) -> None:
         #: Full blocks this request has produced that the pool has not inserted.
@@ -105,6 +107,23 @@ class VllmRequest:
         # already computes for `beneficiaries` is the same relationship: an
         # entry with dependents is exactly an interior node.
         self._child_count = child_count
+        #: Whether some other resident's cached chain strictly *extends* this
+        #: one -- i.e. this object is an interior node of the prefix tree.
+        #:
+        #: `leaf` used to be `child_count == 0`, and `child_count` is the size
+        #: of the sharing set, which is **symmetric**: if A shares a block with
+        #: B then both sides count each other. On a corpus where 86% of prompt
+        #: tokens are shared that made `leaf` false for very nearly every
+        #: resident, so HotPrefix's "evict leaves before interior nodes"
+        #: tie-break was constant over the whole evictable set and could never
+        #: break a tie (7.167, and 7.186 fixed the parked half without fixing
+        #: the symmetry). Descent is asymmetric: R is interior when a peer
+        #: holding R's deepest block holds a strictly deeper chain.
+        self._interior = interior
+
+    def set_interior(self, interior: bool) -> None:
+        """Set after construction: descent is a property of the whole set."""
+        self._interior = interior
 
     @property
     def engine_id(self) -> str:
@@ -211,7 +230,7 @@ class VllmRequest:
         request = self._request
         return {
             "actual_size_bytes": self.actual_size_bytes(),
-            "leaf": self._child_count == 0,
+            "leaf": not self._interior,
             "child_count": self._child_count,
             "cached_length": request.num_computed_tokens,
             "computation_length": (
@@ -404,7 +423,27 @@ MAX_LOOKAHEAD_REQUESTS = 256
 def shared_beneficiaries(
     scheduler: Scheduler, request_ids: list[str]
 ) -> dict[str, list[str]]:
-    """For each resident, every request whose work its blocks serve.
+    """For each resident, every request whose work its blocks serve."""
+    return resident_relations(scheduler, request_ids)[0]
+
+
+def resident_relations(
+    scheduler: Scheduler, request_ids: list[str]
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Sharing (symmetric) and descent (asymmetric), from one holders map.
+
+    Two different relations come out of the same map, and the port used to
+    publish only the first for both purposes:
+
+      sharing   who else sits on, or would hit, my blocks. Symmetric, and the
+                right answer for `beneficiary_count` and `child_count`.
+      descent   whether anyone's cached chain strictly *extends* mine, which is
+                what makes me an interior node rather than a leaf. Asymmetric,
+                and not derivable from `sharing` at all -- see `_interior`.
+
+    Descent costs one extra pass over the residents and none over the blocks.
+
+    For each resident, every request whose work its blocks serve.
 
     A prefix-caching engine hands the same block to every request whose
     prompt shares that prefix, so a resident's real beneficiary set is the
@@ -427,6 +466,10 @@ def shared_beneficiaries(
     """
     pool = scheduler.kv_cache_manager.block_pool
     holders: dict[int, list[str]] = {}
+    #: How far each resident's cached chain runs, and the id of its deepest
+    #: block. Both are read only by the descent pass below.
+    chain_len: dict[str, int] = {}
+    deepest: dict[str, int] = {}
     for request_id in request_ids:
         try:
             groups = scheduler.kv_cache_manager.get_blocks(request_id).blocks
@@ -435,6 +478,8 @@ def shared_beneficiaries(
         for group_blocks in groups:
             for block in group_blocks:
                 holders.setdefault(block.block_id, []).append(request_id)
+                chain_len[request_id] = chain_len.get(request_id, 0) + 1
+                deepest[request_id] = block.block_id
         # And the blocks the pool still holds for a request that has finished.
         #
         # `get_blocks` answers from the live allocation, which a completed
@@ -453,6 +498,8 @@ def shared_beneficiaries(
         # have and no prediction of any kind.
         for block_id in pool.plex_owner_block_ids(request_id):
             holders.setdefault(block_id, []).append(request_id)
+            chain_len[request_id] = chain_len.get(request_id, 0) + 1
+            deepest[request_id] = block_id
 
     sharing: dict[str, set[str]] = {request_id: set() for request_id in request_ids}
     for block_holders in holders.values():
@@ -470,11 +517,24 @@ def shared_beneficiaries(
                 if request_id != waiting.request_id:
                     sharing[request_id].add(waiting.request_id)
 
+    # Descent. R is interior when some *other* holder of R's deepest cached
+    # block runs a strictly longer chain: that peer's prefix contains R's and
+    # continues past it, which is what "R has a child" means in a prefix tree.
+    # Equal-length peers are siblings under a shared ancestor, not children, so
+    # the comparison is strict.
+    interior: set[str] = set()
+    for request_id, block_id in deepest.items():
+        mine = chain_len.get(request_id, 0)
+        for peer in holders.get(block_id, ()):
+            if peer != request_id and chain_len.get(peer, 0) > mine:
+                interior.add(request_id)
+                break
+
     return {
         request_id: sorted(peers)
         for request_id, peers in sharing.items()
         if peers
-    }
+    }, interior
 
 
 def _cache_hit_blocks(scheduler: Scheduler, request: Request) -> list[KVCacheBlock]:
@@ -718,11 +778,12 @@ class VllmEnginePort:
         residents.extend(self.view(request) for request in scheduler.running)
         # One pass over the whole set: sharing is only visible when every
         # resident is considered together, so this cannot be computed per view.
-        sharing = shared_beneficiaries(
+        sharing, interior = resident_relations(
             scheduler, [resident.engine_id for resident in residents]
         )
         for resident in residents:
             resident.set_child_count(len(sharing.get(resident.engine_id, ())))
+            resident.set_interior(resident.engine_id in interior)
         return residents
 
     def capacity(self) -> ScheduleCapacity:
