@@ -414,6 +414,33 @@ class Scheduler(SchedulerInterface):
             # expresses no preference, which is every v0.7 policy.
             "waiting_picked_by_preference": 0,
         }
+        #: The admit channel's counterfactual, in the shape the cache channel
+        #: already has. `prefix_evict_diverged` exists because a ranking that
+        #: reproduces LRU is credited with every block it names; the admit
+        #: channel had the same blindness and no counter for it, and worse: the
+        #: precondition read `sched_steps_with_queue`, a queue that admission
+        #: control empties by working. What the engine would natively have done
+        #: with an arrival is enqueue it, on the step it arrived. So a decision
+        #: diverged when the request's entry into the waiting queue differed
+        #: from that -- refused outright, or held across at least one step the
+        #: engine would have had it queued for.
+        #:
+        #: `decided` is the denominator and counts only settlements the policy
+        #: authored. An admission the engine defaulted after the deadline is
+        #: silence, not agreement, and it is counted in `defaulted` instead.
+        self._plex_admit: dict[str, int] = {
+            "arrivals": 0,
+            "held": 0,
+            "decided": 0,
+            "defaulted": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "delayed": 0,
+            "diverged": 0,
+            "delay_steps_sum": 0,
+        }
+        #: Step clock reading when each held arrival left the waiting queue.
+        self._plex_held_at_step: dict[str, int] = {}
         if self.scheduler_config.plex_policy is not None:
             self.plex = AsyncPlexPolicyController.from_policy(
                 self.scheduler_config.plex_policy,
@@ -2633,6 +2660,7 @@ class Scheduler(SchedulerInterface):
             self._activate_request(request)
             if self.plex is not None:
                 self.plex.register_request(request)
+                self._plex_admit["arrivals"] += 1
                 if self.plex.awaiting_admission():
                     # The policy has not ruled yet. Hold the request out of
                     # every scheduling queue: an admission control that runs
@@ -2644,27 +2672,54 @@ class Scheduler(SchedulerInterface):
             return
         self.waiting.remove_request(request)
         self._plex_held[request.request_id] = request
+        self._plex_admit["held"] += 1
+        self._plex_held_at_step[request.request_id] = self._plex_choice["steps"]
 
     def _release_plex_admissions(self) -> None:
         """Move settled arrivals into the queue, or drop the ones refused."""
         if self.plex is None or not self._plex_held:
             return
         rejected: list[str] = []
-        for engine_id, accepted in self.plex.take_admissions().items():
+        for engine_id, verdict in self.plex.take_admissions().items():
             request = self._plex_held.pop(engine_id, None)
+            held_at = self._plex_held_at_step.pop(engine_id, None)
             if request is None:
                 continue
-            if accepted:
+            if verdict.accepted:
                 self._enqueue_waiting_request(request)
             else:
                 # Put it back where finish_requests expects to find it, so
                 # the one code path that notifies the caller still runs.
                 self._enqueue_waiting_request(request)
                 rejected.append(engine_id)
+            self._count_admission(verdict, held_at)
         if rejected:
             self.plex.note_finished(
                 self.finish_requests(rejected, RequestStatus.FINISHED_ABORTED)
             )
+
+    def _count_admission(
+        self, verdict: "AdmissionVerdict", held_at: int | None
+    ) -> None:
+        """Score one settled admission against what the engine would have done.
+
+        Natively the arrival would have been queued on the step it arrived, so
+        the divergence is a refusal, or a delay the engine would not have taken.
+        """
+        delay = 0 if held_at is None else self._plex_choice["steps"] - held_at
+        self._plex_admit["delay_steps_sum"] += delay
+        if not verdict.by_policy:
+            self._plex_admit["defaulted"] += 1
+            return
+        self._plex_admit["decided"] += 1
+        if not verdict.accepted:
+            self._plex_admit["rejected"] += 1
+            self._plex_admit["diverged"] += 1
+            return
+        self._plex_admit["accepted"] += 1
+        if delay > 0:
+            self._plex_admit["delayed"] += 1
+            self._plex_admit["diverged"] += 1
 
     def _activate_request(self, request: Request) -> None:
         if request.resumable and request.streaming_queue is None:

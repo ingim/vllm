@@ -6981,6 +6981,101 @@ def test_plex_admits_natively_when_the_policy_never_answers(monkeypatch):
     }, "past the deadline the engine admits on its own terms"
 
 
+def test_plex_admit_counterfactual_scores_refusals_and_delays(monkeypatch):
+    """The admit channel's answer to `prefix_evict_diverged`.
+
+    §4(a) reads `sched_steps_with_queue`, which admission control empties by
+    working: the policy holds arrivals before they reach the waiting queue, so
+    the counter the precondition reads goes to zero exactly when the channel is
+    most influential. What the engine would natively do with an arrival is
+    queue it on the step it arrived, so the honest comparison is against that --
+    a refusal, or a delay the engine would not have taken.
+    """
+    monkeypatch.setattr(envs, "PLEX_ADMISSION_CONTROL", True)
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.publish_plex()
+
+    assert scheduler._plex_admit["arrivals"] == 2
+    assert scheduler._plex_admit["held"] == 2
+    assert scheduler._plex_admit["decided"] == 0, (
+        "nothing is scored before the policy has ruled"
+    )
+
+    scheduler.schedule()
+    epoch = [
+        epoch
+        for channel, epoch, _ in runtime.submissions
+        if channel == "admit"
+    ][-1]
+    runtime.latest_results["admit"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "admit",
+                "plan": {"decisions": ["accept", "reject"]},
+            },
+            "state_update": {"shared": None, "groups": [], "requests": []},
+            "actions": [],
+        },
+    )
+    scheduler.publish_plex()
+    scheduler.schedule()
+
+    admit = scheduler._plex_admit
+    assert admit["decided"] == 2
+    assert admit["defaulted"] == 0
+    assert admit["rejected"] == 1
+    assert admit["accepted"] == 1
+    assert admit["delayed"] == 1, (
+        "the accepted arrival was held across a step the engine would have "
+        "had it queued for, and that is a divergence even though it ran"
+    )
+    assert admit["diverged"] == 2
+    assert admit["delay_steps_sum"] >= 2
+
+
+def test_plex_admit_counterfactual_refuses_to_credit_an_engine_default(
+    monkeypatch,
+):
+    """A gate that has never refused anything has not been tested.
+
+    Silence is admitted, because silence is not a veto -- but crediting that
+    admission to the policy would let a channel that never replied score a full
+    share of agreement with the engine, which is the precise shape of the
+    `fallback: 0` mistake this project has already made once.
+    """
+    monkeypatch.setattr(envs, "PLEX_ADMISSION_CONTROL", True)
+    runtime = FakeAsyncRuntime()
+    scheduler = create_scheduler()
+    attach_plex(scheduler, runtime)
+    request = create_requests(num_requests=1, num_tokens=10)[0]
+    scheduler.add_request(request)
+    scheduler.publish_plex()
+    scheduler.schedule()
+
+    monkeypatch.setattr(
+        scheduler.plex.controller, "ADMISSION_DEADLINE_S", 0.0
+    )
+    scheduler.publish_plex()
+
+    assert set(scheduler.schedule().num_scheduled_tokens) == {
+        request.request_id
+    }, "the engine still admits it -- the counter changes nothing it enacts"
+    admit = scheduler._plex_admit
+    assert admit["defaulted"] == 1
+    assert admit["decided"] == 0, (
+        "an admission the engine defaulted is not a decision the policy made"
+    )
+    assert admit["diverged"] == 0
+    assert admit["accepted"] == 0
+
+
 def _plex_pause_fixture(
     monkeypatch, *, allow: bool, kv: str = "release", limit: int = 3,
     already_displaced: int = 0, name: str | None = None,

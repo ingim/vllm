@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from plex.engine import (
     NO_SIGNALS,
     AdmissionCapacity,
+    AdmissionVerdict,
     CacheCapacity,
     CacheDecision,
     PolicyController,
@@ -720,6 +721,10 @@ class VllmEnginePort:
         # make. A ranking over an empty queue is arithmetic, not a decision.
         for key, value in getattr(self.scheduler, "_plex_choice", {}).items():
             stats[f"sched_{key}"] = value
+        # The admit channel's own counterfactual, kept out of `sched_` because
+        # it is a different channel measured against a different default.
+        for key, value in getattr(self.scheduler, "_plex_admit", {}).items():
+            stats[f"admit_{key}"] = value
         return stats
 
     def prune_parked(self) -> int:
@@ -1471,7 +1476,7 @@ class AsyncPlexPolicyController:
     def holds(self, engine_id: str) -> bool:
         return self.controller.holds(engine_id)
 
-    def take_admissions(self) -> dict[str, bool]:
+    def take_admissions(self) -> dict[str, AdmissionVerdict]:
         return self.controller.take_admissions()
 
     def note_finished(self, finished: list[tuple[str, int]]) -> None:
