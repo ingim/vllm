@@ -220,6 +220,9 @@ class EngrainBackend(StructuredOutputBackend):
         self._warned_about_narrowing = False
         self._warned_about_bounds = False
         self._warned_about_window = False
+        self._narrowed_rows = 0
+        self._narrowed_steps = 0
+        self._narrow_report = 1
         self._announced = False
         self._assigned: list[int] | None = None
         self._phases: dict[str, list] = {}
@@ -585,14 +588,26 @@ class EngrainBackend(StructuredOutputBackend):
             return host, narrowed
 
     def _warn_narrowed(self, count: int) -> None:
-        if self._warned_about_narrowing:
+        """Say it once, then say it again when it stops being a curiosity.
+
+        A row that narrows falls back to the reference matcher, and a host fill
+        is ~1.5 ms - so one row is a footnote and a hundred a step is the whole
+        serving loop. Warning once could not tell those apart, and on the exact
+        fragment the difference was the whole result.
+        """
+        self._narrowed_rows += count
+        self._narrowed_steps += 1
+        if self._narrowed_steps < self._narrow_report:
             return
-        self._warned_about_narrowing = True
+        self._narrow_report *= 10
         logger.warning(
             "engrain: %d row(s) met a ceiling mid-parse and were given a "
-            "narrowed mask. Those rows fall back to the reference matcher, so "
-            "the mask is exact; the cost is that they leave the device.",
-            count,
+            "narrowed mask, over %d step(s) - %.1f rows a step. Those rows "
+            "fall back to the reference matcher, so the mask is exact; the "
+            "cost is that they leave the device.",
+            self._narrowed_rows,
+            self._narrowed_steps,
+            self._narrowed_rows / self._narrowed_steps,
         )
 
     def _verify(self, rows, host, narrowed) -> None:
