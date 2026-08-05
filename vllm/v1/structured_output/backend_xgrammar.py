@@ -79,8 +79,18 @@ class XgrammarBackend(StructuredOutputBackend):
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
+            # `any_order` is not exposed by vLLM, so XGrammar is always asked
+            # for the *ordered* lowering: an object's properties must arrive in
+            # the order the schema declares them. That is narrower than JSON
+            # Schema - a valid document with its keys permuted is refused - and
+            # it is also cheaper. `XGRAMMAR_ANY_ORDER=1` asks for the lowering
+            # that means what the schema means, so the two can be told apart.
+            import os
+
             ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
+                grammar_spec,
+                any_whitespace=not self.disable_any_whitespace,
+                any_order=os.environ.get("XGRAMMAR_ANY_ORDER") == "1",
             )
         elif request_type == StructuredOutputOptions.JSON_OBJECT:
             ctx = self.compiler.compile_json_schema(
