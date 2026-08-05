@@ -425,15 +425,34 @@ def shared_beneficiaries(
                 half, Peek scored 0.69 on prefix hit rate; the demand it is
                 supposed to read was all in the queue.
     """
+    pool = scheduler.kv_cache_manager.block_pool
     holders: dict[int, list[str]] = {}
     for request_id in request_ids:
         try:
             groups = scheduler.kv_cache_manager.get_blocks(request_id).blocks
         except (KeyError, AttributeError):
-            continue
+            groups = ()
         for group_blocks in groups:
             for block in group_blocks:
                 holders.setdefault(block.block_id, []).append(request_id)
+        # And the blocks the pool still holds for a request that has finished.
+        #
+        # `get_blocks` answers from the live allocation, which a completed
+        # request has released, so a **parked** resident contributed nothing
+        # here and appeared in no other resident's sharing set -- its
+        # `child_count` came back 0 and `leaf` came back true. Parked residents
+        # are exactly the population eviction acts on (`_plex_take` reads
+        # `_plex_owner_blocks`), so HotPrefix's "leaves before interior nodes"
+        # tie-break was constant over every object it could ever have ordered,
+        # and Peek's `beneficiary_count` was blind to the pending demand on a
+        # finished request's prefix -- which is the half `shared_beneficiaries`
+        # was written to supply (7.186).
+        #
+        # `plex_owner_block_ids` is the pool's own record of what it retains for
+        # that owner, so this adds no information the engine did not already
+        # have and no prediction of any kind.
+        for block_id in pool.plex_owner_block_ids(request_id):
+            holders.setdefault(block_id, []).append(request_id)
 
     sharing: dict[str, set[str]] = {request_id: set() for request_id in request_ids}
     for block_holders in holders.values():
