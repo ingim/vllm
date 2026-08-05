@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
     PLEX_ADMISSION_CONTROL: bool = False
+    PLEX_CACHE_NODE_OBJECTS: bool = False
     PLEX_SCHEDULE_RANK_WAITING: bool = False
     PLEX_SCHEDULE_ALLOW_DEMOTION: bool = False
     PLEX_DEMOTION_LIMIT: int = 0
@@ -828,6 +829,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # meaningful for a policy that implements `admit`; anything else pays
     # the admission deadline on every request and admits it anyway.
     "PLEX_ADMISSION_CONTROL": lambda: bool(int(os.getenv("PLEX_ADMISSION_CONTROL", "0"))),
+    # Name each object about to enter the cache by its prefix-tree node (the
+    # block hash) instead of by the request filling it.
+    #
+    # Opt-in, because it is not a free improvement. HotPrefix needs it: named by
+    # the request, the same object is re-offered 21.5 times as that request fills
+    # blocks, so "being offered is a miss on this prefix" counts generation
+    # length (7.167). But `preble` does budget arithmetic over
+    # `ctx.prospective[index].size_bytes` and sorts by it, and per-node entries
+    # report one page each instead of the request's whole pending size -- which
+    # would move a policy that currently reproduces at 1.2602 on the metric that
+    # settles its claim. A port-wide switch would change every cache policy at
+    # once; this changes the ones a run asks it to.
+    "PLEX_CACHE_NODE_OBJECTS": lambda: bool(
+        int(os.getenv("PLEX_CACHE_NODE_OBJECTS", "0"))
+    ),
     # Let a schedule plan rank requests that are still waiting, by reporting a
     # selection allowance larger than the running set. Off by default so the
     # two states are measurable on one build; see

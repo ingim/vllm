@@ -70,6 +70,7 @@ class VllmRequest:
         "_attained_service",
         "_child_count",
         "_interior",
+        "_node_id",
         "_pending_blocks",
     )
 
@@ -83,6 +84,7 @@ class VllmRequest:
         child_count: int = 0,
         interior: bool = False,
         pending_blocks: int = 0,
+        node_id: str | None = None,
     ) -> None:
         #: Full blocks this request has produced that the pool has not inserted.
         #: Non-zero only on a prospective entry; see `pending_bytes`.
@@ -120,6 +122,21 @@ class VllmRequest:
         #: the symmetry). Descent is asymmetric: R is interior when a peer
         #: holding R's deepest block holds a strictly deeper chain.
         self._interior = interior
+        #: The prefix-tree node this view stands for, when it stands for one.
+        #:
+        #: A prospective entry named by its owning *request* is re-offered every
+        #: time that request fills another block -- 21.5 times per request on
+        #: this experiment -- so HotPrefix's "being offered is a miss on this
+        #: prefix" counted generation length instead (7.167). Named by the block
+        #: hash, an entry is offered once when the node is created and again only
+        #: when it was evicted and something missed on it, which is the access
+        #: the rule is written about. The hash is content-derived, so two
+        #: requests sharing a prefix produce the same id.
+        self._node_id = node_id
+
+    @property
+    def node_id(self) -> str | None:
+        return self._node_id
 
     def set_interior(self, interior: bool) -> None:
         """Set after construction: descent is a property of the whole set."""
@@ -642,6 +659,7 @@ class VllmEnginePort:
         request: Request,
         attained_service: int | None = None,
         pending_blocks: int = 0,
+        node_id: str | None = None,
     ) -> VllmRequest:
         return VllmRequest(
             request,
@@ -649,6 +667,7 @@ class VllmEnginePort:
             self._signals.get(request.request_id),
             attained_service=attained_service,
             pending_blocks=pending_blocks,
+            node_id=node_id,
         )
 
     def candidates(self) -> list[VllmRequest]:
@@ -850,6 +869,8 @@ class VllmEnginePort:
         prospective entry to report only the *incremental* bytes, so the
         retained-bytes arithmetic still adds up.
         """
+        from vllm.v1.core.kv_cache_utils import resolve_block_hashes
+
         scheduler = self.scheduler
         pool = scheduler.kv_cache_manager.block_pool
         per_block = block_tokens(scheduler)
@@ -862,7 +883,35 @@ class VllmEnginePort:
             if full <= cached:
                 # Nothing full and uninserted, so there is no decision to put.
                 continue
-            offered.append(self.view(request, pending_blocks=full - cached))
+            if not envs.PLEX_CACHE_NODE_OBJECTS:
+                offered.append(self.view(request, pending_blocks=full - cached))
+                continue
+            # One entry per *node*, not one per request. The block hash is what
+            # the pool keys its prefix cache on, it is content-derived, and two
+            # requests sharing a prefix produce the same bytes -- so an offer
+            # names the prefix that was missed rather than the request that
+            # happens to be filling it (7.167, and `_node_id`).
+            try:
+                hashes = resolve_block_hashes(
+                    request.block_hashes, pool.hash_block_size, per_block
+                )
+            except Exception:  # noqa: BLE001 - a port must not fail the step
+                hashes = ()
+            if len(hashes) < full:
+                # The hash view is shorter than the block count this request has
+                # filled, so the ids would not line up with the blocks the pool
+                # is about to insert. Fall back to the request-named entry rather
+                # than name a node after the wrong block.
+                offered.append(self.view(request, pending_blocks=full - cached))
+                continue
+            for index in range(cached, full):
+                offered.append(
+                    self.view(
+                        request,
+                        pending_blocks=1,
+                        node_id=hashes[index].hex(),
+                    )
+                )
         return offered
 
     def cache_capacity(self, residents: list[VllmRequest]) -> CacheCapacity:

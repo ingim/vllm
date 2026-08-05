@@ -355,11 +355,17 @@ class BlockPool:
         # `bypass` prevents persistent insertion even when capacity is free
         # (`docs/plex_0.6_contract.md` section 11.2), so it has to be checked
         # before the block enters the hash map rather than evicted afterwards.
+        declined: object = ()
         if self._plex_cache_bypass is not None:
             try:
                 declined = self._plex_cache_bypass()
             except Exception:
                 declined = ()
+            # A port that names objects per request declines whole requests; one
+            # that names prefix-tree nodes declines individual block hashes, and
+            # that check has to happen per block inside the loop below. Both
+            # forms are honoured, because the request-named form is what every
+            # other port still speaks.
             if request.request_id in declined:
                 self._plex_admission_bypassed += 1
                 return
@@ -380,6 +386,14 @@ class BlockPool:
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
             block_hash = new_block_hashes[i]
+            # The node-named half of the admission answer. A bypassed block is
+            # not inserted, and neither is anything after it: vLLM's lookup walks
+            # from block 0 and stops at the first miss, so an entry behind a gap
+            # is resident and unreachable -- it would hold pool capacity and
+            # serve nothing.
+            if declined and block_hash.hex() in declined:
+                self._plex_admission_bypassed += 1
+                break
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
 
             # Update and added the full block to the cache.
