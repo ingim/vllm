@@ -77,8 +77,75 @@ class PlexVerbs:
     is to turn each into a primitive call or a refusal.
     """
 
+    @staticmethod
+    def maybe(scheduler: Scheduler) -> PlexVerbs | None:
+        """Attach verbs if a source was named, and otherwise cost nothing.
+
+        `VLLM_PLEX_VERBS=/path/to/verbs.jsonl` — one staged verb per
+        line, drained at the step boundary. A file rather than a callback
+        for the same reason the table is one: the policy runs in the PLEX
+        host, and the engine must not import a runtime, block on one, or
+        be able to fail because one is slow.
+        """
+        import os
+
+        if not os.environ.get("VLLM_PLEX_VERBS"):
+            return None
+        return PlexVerbs(scheduler)
+
+    def drain(self) -> int:
+        """Enact everything staged since the last call.
+
+        **Called at the step boundary, never mid-pass.** A verb is a
+        write, and vLLM's scheduling loop is not reentrant with respect
+        to its own running list — `_pause` removes from `running`, which
+        is exactly what the loop is iterating. The standing table learned
+        this by crashing the engine; the verbs get it for free by
+        draining where the table reloads.
+
+        Returns how many took effect. Lines that cannot be read are
+        skipped rather than failing the engine: a malformed instruction
+        is the policy's error and stopping inference is not the
+        proportionate response.
+        """
+        import json
+        import os
+
+        path = os.environ.get("VLLM_PLEX_VERBS")
+        if not path:
+            return 0
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return 0
+        if len(lines) <= self._drained:
+            return 0
+
+        applied = 0
+        for line in lines[self._drained :]:
+            try:
+                staged = json.loads(line)
+                verb = str(staged["verb"])
+                subject = str(staged["subject"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            kwargs = {
+                key: value
+                for key, value in staged.items()
+                if key not in ("verb", "subject")
+            }
+            if self.enact(verb, subject, **kwargs):
+                applied += 1
+        self._drained = len(lines)
+        return applied
+
     def __init__(self, scheduler: Scheduler) -> None:
         self._scheduler = scheduler
+        # How much of the staged file has already been enacted. A verb is
+        # an instruction, not a document: replaying one would pause a
+        # request twice.
+        self._drained = 0
         self._refusals: list[Refusal] = []
 
     def take_refusals(self) -> list[Refusal]:

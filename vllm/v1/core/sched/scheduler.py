@@ -425,6 +425,15 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # PLEX v2 stage-3 attach: staged verbs, applied before the pass.
+        #
+        # Here rather than at the observer's step hook, which sits *inside*
+        # this method: `pause` removes from `self.running`, and applying
+        # that after the scheduling loops have run tripped the assert
+        # below on `scheduled_resumed_reqs`. Observation is safe mid-pass
+        # and writes are not.
+        if self.plex_observer is not None:
+            self.plex_observer.drain_verbs()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and

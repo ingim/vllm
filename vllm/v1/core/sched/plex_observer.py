@@ -72,6 +72,11 @@ class PlexObserver:
         # Edges since the last document. Cleared on emit, because an event
         # delivered twice is one thing a policy counts as two.
         self._admitted: list[str] = []
+        # Stage 3, if a source was named. `None` costs nothing, which is
+        # what lets stage 1 be reviewed on its own.
+        from vllm.v1.core.sched.plex_verbs import PlexVerbs
+
+        self._verbs = PlexVerbs.maybe(scheduler)
         self._finished: list[list[str]] = []
 
     # ── the hooks, and there are two ─────────────────────────────────────
@@ -115,6 +120,20 @@ class PlexObserver:
         except Exception:  # noqa: BLE001 - see docstring
             self._sink = None
             self._scheduler.plex_observer = None
+
+    def drain_verbs(self) -> int:
+        """Enact staged verbs. Called before a scheduling pass begins.
+
+        Separate from `on_step` because a verb is a *write* and the
+        observer's hook sits inside `schedule()`. `pause` removes from
+        `scheduler.running`, and doing that after the scheduling loops
+        have run trips the engine's own assert on resumed requests — the
+        second time a PLEX write applied at the wrong moment has crashed
+        a real engine. Observation is safe mid-pass; writes are not.
+        """
+        if self._verbs is None:
+            return 0
+        return self._verbs.drain()
 
     def on_step(self) -> str:
         """One scheduler step, as a document the port reads."""
