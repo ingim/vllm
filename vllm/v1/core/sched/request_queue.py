@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import os
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -200,6 +201,12 @@ class PriorityRequestQueue(RequestQueue):
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
+    # PLEX v2 stage-2 attach: a standing schedule table is a queue policy,
+    # so it is one. Off unless VLLM_PLEX_SCHEDULE is set; see plex_queue.py.
+    if os.environ.get("VLLM_PLEX_SCHEDULE"):
+        from vllm.v1.core.sched.plex_queue import PlexRequestQueue
+
+        return PlexRequestQueue()
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
