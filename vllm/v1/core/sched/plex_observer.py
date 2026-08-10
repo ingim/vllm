@@ -147,12 +147,13 @@ class PlexObserver:
         if reload_table is not None:
             reload_table()
         self._step += 1
+        document_now_ms = int(time.time() * 1000)
         document = {
             "step": self._step,
-            "now-ms": int(time.time() * 1000),
+            "now-ms": document_now_ms,
             "target": self._target,
             "subjects": self._subjects(),
-            "facts": self._facts(),
+            "facts": self._facts(document_now_ms),
             "events": self._events(),
         }
         self._admitted.clear()
@@ -171,7 +172,7 @@ class PlexObserver:
             "target": [self._target],
         }
 
-    def _facts(self) -> dict[str, dict[str, Any]]:
+    def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {request.request_id for request in self._scheduler.running}
         facts: dict[str, dict[str, Any]] = {}
         for request in self._tracked():
@@ -190,6 +191,11 @@ class PlexObserver:
                 "cached_tokens": {"num": computed},
                 "queue_member": {"flag": not running},
                 "preempted": {"flag": request.num_preemptions > 0},
+                # How long it has been here. The engine holds both
+                # operands and the port holds neither, which is the
+                # standing test for whether a derivation belongs on this
+                # side.
+                "waiting_ms": {"num": max(now_ms - int(request.arrival_time * 1000), 0)},
             }
         facts[self._target] = self._target_facts()
         return facts
@@ -200,11 +206,48 @@ class PlexObserver:
         block_size = scheduler.cache_config.block_size
         total_blocks = pool.num_gpu_blocks
         free_blocks = pool.get_num_free_blocks()
+        running = list(scheduler.running)
+        max_running = scheduler.max_num_running_reqs
+        # Output tokens the engine still owes, and prompt tokens it has
+        # yet to prefill. Both are sums over state the scheduler already
+        # holds; neither is a model of anything.
+        pending_decode = sum(
+            max(request.max_tokens - len(request.output_token_ids), 0)
+            for request in running
+        )
+        queued_tokens = sum(
+            max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+            for request in scheduler.waiting
+        )
+        decoding = sum(1 for request in running if request.output_token_ids)
         return {
             "queue_depth": {"num": len(scheduler.waiting)},
-            "running_requests": {"num": len(scheduler.running)},
-            "batch_size": {"num": len(scheduler.running)},
-            "max_batch_size": {"num": scheduler.max_num_running_reqs},
+            "running_requests": {"num": len(running)},
+            "batch_size": {"num": len(running)},
+            "decode_batch_size": {"num": len(running)},
+            "max_batch_size": {"num": max_running},
+            # An alias the corpus reads under a second name (helium,
+            # llumnix). Published rather than left absent: a policy
+            # reading it gets `unknown-key` and silently takes a default,
+            # which is how `targets` made thirteen cache policies inert.
+            "max_requests": {"num": max_running},
+            "free_decode_slots": {"num": max(max_running - len(running), 0)},
+            "pending_decode_tokens": {"num": pending_decode},
+            "queued_tokens": {"num": queued_tokens},
+            "decoder_ratio_ppm": {
+                "num": min(decoding * 1_000_000 // len(running), 1_000_000)
+                if running
+                else 0
+            },
+            "kv_overloaded": {"flag": free_blocks < total_blocks / 10},
+            "used_kv_ppm": {
+                "num": min(
+                    (total_blocks - free_blocks) * 1_000_000 // total_blocks,
+                    1_000_000,
+                )
+                if total_blocks
+                else 0
+            },
             # Blocks to tokens: the one derivation here, and only because
             # the block size lives on the engine and the port has no way
             # to know it.
