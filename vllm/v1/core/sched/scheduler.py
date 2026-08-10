@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.plex_observer import maybe_plex_observer
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -184,6 +185,10 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # PLEX v2 stage-1 attach: observation only, no influence. Off unless
+        # VLLM_PLEX_OBSERVE names a sink; see plex_observer.py.
+        self.plex_observer = maybe_plex_observer(self)
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -1064,6 +1069,9 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+
+        if self.plex_observer is not None:
+            self.plex_observer.emit_step()
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -2135,6 +2143,8 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if self.plex_observer is not None:
+                self.plex_observer.on_request_added(request)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2204,6 +2214,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.plex_observer is not None:
+            self.plex_observer.on_request_freed(request)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
