@@ -914,6 +914,27 @@ class VllmEnginePort:
                 )
         return offered
 
+    def _budgeted_admissions(self) -> dict[str, int]:
+        """Pending bytes per prospective OBJECT, as the SDK will deliver them.
+
+        `prospective()` offers one entry per (request, node) pair. The
+        controller then collapses those by object id and caps the result at
+        `MAX_WORKING_SET_REQUESTS`, so a budget summed over the raw offer
+        prices objects that are never put to the policy. Mirrored here rather
+        than approximated: same partition key (`node_id` when the port supplies
+        one, else the request), same per-object sum, same cap, same order.
+        """
+        pending: dict[str, int] = {}
+        for request in self.prospective():
+            node = getattr(request, "node_id", None)
+            key = node if node else request.engine_id
+            pending[key] = pending.get(key, 0) + max(request.pending_bytes(), 1)
+        if len(pending) <= events.MAX_WORKING_SET_REQUESTS:
+            return pending
+        return dict(
+            itertools.islice(pending.items(), events.MAX_WORKING_SET_REQUESTS)
+        )
+
     def cache_capacity(self, residents: list[VllmRequest]) -> CacheCapacity:
         """Budget the shortfall the engine is about to take from the cache.
 
@@ -1042,7 +1063,20 @@ class VllmEnginePort:
         # to insert regardless, which leaves the admission genuinely free and
         # keeps the pressure where it belongs -- the policy must still give up
         # `wanted` of the residents it was offered.
-        admissible = sum(request.pending_bytes() for request in self.prospective())
+        #
+        # Budgeted over the entries the SDK will actually DELIVER, not over
+        # everything `prospective()` returns. The controller collapses the
+        # offer by object id and then caps it at `MAX_WORKING_SET_REQUESTS`
+        # (`controller.py:1860`, `:1871`), so the two populations differ
+        # whenever node granularity is on: measured on `hotprefix--nodes3`,
+        # 694.9 offered per invocation against 257.4 delivered, a 2.7x
+        # inflation. Every inflated byte is credited to an object the policy is
+        # structurally forbidden to admit, and it lands in `max_bytes` -- the
+        # one quantity `reclaim_required` tests -- so the error pushes toward
+        # never demanding a reclaim. Same defect as the two above and the same
+        # shape as `fixed_bytes`: a sum taken over a different population than
+        # the one it is compared against.
+        admissible = sum(self._budgeted_admissions().values())
         return CacheCapacity(
             max_bytes=(
                 unit * unoffered
