@@ -118,6 +118,15 @@ class PlexObserver:
 
     def on_step(self) -> str:
         """One scheduler step, as a document the port reads."""
+        # A standing table lands here, between scheduling passes, because
+        # this is the one place per step where the scheduler is provably
+        # not iterating its own queue. Reloading inside `pop_request`
+        # crashed a real engine with `KeyError`: vLLM peeks a request,
+        # allocates blocks for it, then pops, and a re-sort in between
+        # hands it a request it never allocated for.
+        reload_table = getattr(self._scheduler.waiting, "reload", None)
+        if reload_table is not None:
+            reload_table()
         self._step += 1
         document = {
             "step": self._step,

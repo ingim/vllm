@@ -42,6 +42,8 @@ behaviour: the alternative is a port that half-enacts and reports success.
 
 from __future__ import annotations
 
+import json
+import os
 from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -60,8 +62,14 @@ class PlexRequestQueue(RequestQueue):
     table names.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, source: str | None = None) -> None:
         self._requests: deque[Request] = deque()
+        # Where the policy's table arrives from. A path rather than a
+        # callback because the policy runs in the PLEX host, not in the
+        # engine: the engine must not import a runtime, block on one, or
+        # be able to fail because one is slow.
+        self._source = source if source else os.environ.get("VLLM_PLEX_TABLE")
+        self._source_stamp: tuple[int, int] | None = None
         # request id -> rank. Replaced wholesale on install: a table is a
         # document, not a stream of edits, so a partially-applied one is
         # not representable.
@@ -113,6 +121,43 @@ class PlexRequestQueue(RequestQueue):
         self._requests = deque(ordered)
 
     # ── RequestQueue ─────────────────────────────────────────────────────
+
+    def reload(self) -> None:
+        """Pick up a newly written table, if there is one.
+
+        **Call this between scheduling passes, never during one.** The
+        first version polled inside `pop_request`, and a real engine
+        crashed with `KeyError` on a request id: vLLM's scheduling loop
+        peeks a request, allocates blocks for it, then pops — so a
+        re-sort between the peek and the pop hands it a request it never
+        allocated for. The contract already says this at the policy
+        level ("facts do not move under a policy mid-call"); a standing
+        table owes the engine the same courtesy.
+
+        Polling rather than notification, and on the engine's own thread.
+        The alternative is a watcher that can wake the scheduler, which
+        makes a policy able to affect *when* the engine runs rather than
+        only what it prefers — a much larger claim than stage 2 makes.
+
+        A table that is missing, unreadable or malformed leaves the
+        current one standing. The engine has a working order either way,
+        and an order it can explain is better than one it half-applied.
+        """
+        if not self._source:
+            return
+        try:
+            stat = os.stat(self._source)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._source_stamp:
+                return
+            with open(self._source, encoding="utf-8") as handle:
+                order = json.load(handle)
+            if not isinstance(order, list):
+                return
+            self._source_stamp = stamp
+        except (OSError, ValueError):
+            return
+        self.install([str(entry) for entry in order])
 
     def add_request(self, request: Request) -> None:
         self._arrivals += 1
