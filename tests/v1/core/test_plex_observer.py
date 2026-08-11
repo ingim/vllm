@@ -25,21 +25,43 @@ class FakeRequest:
         self.num_preemptions = 0
 
 
+class FakeBlock:
+    """One entry on vLLM's free list."""
+
+    def __init__(self, block_hash=None, tokens=16, ref_cnt=0):
+        self.block_hash = block_hash
+        self._block_hash_num_tokens = tokens
+        self.ref_cnt = ref_cnt
+        self.next_free_block = None
+
+
+def free_list(blocks):
+    """vLLM's free queue: a sentinel head, then blocks, coldest first."""
+    head = FakeBlock()
+    node = head
+    for block in blocks:
+        node.next_free_block = block
+        node = block
+    return types.SimpleNamespace(fake_free_list_head=head)
+
+
 class FakeScheduler:
-    def __init__(self, waiting, running):
+    def __init__(self, waiting, running, free_blocks=()):
         self.waiting = waiting
         self.running = running
         self.max_num_running_reqs = 8
         pool = types.SimpleNamespace(
-            num_gpu_blocks=100, get_num_free_blocks=lambda: 40
+            num_gpu_blocks=100,
+            get_num_free_blocks=lambda: 40,
+            free_block_queue=free_list(list(free_blocks)),
         )
         self.kv_cache_manager = types.SimpleNamespace(block_pool=pool)
         self.cache_config = types.SimpleNamespace(block_size=16)
         self.plex_observer = None
 
 
-def observer(waiting, running):
-    scheduler = FakeScheduler(waiting, running)
+def observer(waiting, running, free_blocks=()):
+    scheduler = FakeScheduler(waiting, running, free_blocks)
     sink = types.SimpleNamespace(write=lambda _: None, flush=lambda: None)
     return PlexObserver(scheduler, sink, "vllm-0")
 
@@ -130,3 +152,60 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {error}")
     raise SystemExit(1 if failures else 0)
+
+
+def test_only_offered_pages_are_published_not_the_whole_pool():
+    # The narrower question on purpose. A page-level snapshot of the pool
+    # is per-block state on every step, which is a different order of
+    # cost from the per-request scrape the rest of the observer does —
+    # and it hands a policy thousands of subjects when the engine is
+    # about to reuse a handful.
+    blocks = [FakeBlock(block_hash=f"h{i}") for i in range(4)]
+    obs = observer([], [], free_blocks=blocks)
+
+    doc = json.loads(obs.on_step())
+    pages = doc["subjects"]["page"]
+
+    assert len(pages) == 4, doc["subjects"]
+    for page_id in pages:
+        facts = doc["facts"][page_id]
+        assert facts["resident"] == {"flag": True}, "an eviction candidate is still in the pool"
+        assert facts["tier"] == {"text": "gpu"}
+        assert facts["page-tokens"] == {"num": 16}
+
+
+def test_a_block_with_no_hash_is_not_a_page():
+    # Identity is the content hash: it is what makes a page the *same*
+    # page across steps, so a hotness ledger keyed on it survives
+    # eviction and readmission without being reaped. A block with no hash
+    # has no stable name, and naming it by slot would give a policy a
+    # ledger that silently follows whatever lands there next.
+    obs = observer([], [], free_blocks=[FakeBlock(block_hash=None)])
+    doc = json.loads(obs.on_step())
+    assert "page" not in doc["subjects"], doc["subjects"]
+
+
+def test_offered_is_raised_once_per_page_not_once_per_step():
+    # Every accumulator in the corpus counts one offer as one. Re-raising
+    # `offered` each step for a page still sitting on the free list would
+    # make a cache policy count a single offer as many.
+    blocks = [FakeBlock(block_hash="h0")]
+    obs = observer([], [], free_blocks=blocks)
+
+    first = json.loads(obs.on_step())
+    second = json.loads(obs.on_step())
+
+    assert len(first["events"]["offered"]) == 1
+    assert "offered" not in second["events"], second["events"]
+
+
+def test_a_pool_with_no_free_list_publishes_no_pages_rather_than_failing():
+    # An engine build without the attribute must lose the cache channel,
+    # not the engine. Observation is never allowed to stop inference.
+    scheduler = FakeScheduler([], [])
+    scheduler.kv_cache_manager.block_pool = types.SimpleNamespace()
+    sink = types.SimpleNamespace(write=lambda _: None, flush=lambda: None)
+    obs = PlexObserver(scheduler, sink, "vllm-0")
+
+    doc = json.loads(obs.on_step())
+    assert "page" not in doc["subjects"]

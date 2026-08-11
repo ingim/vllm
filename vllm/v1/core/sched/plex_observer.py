@@ -77,6 +77,12 @@ class PlexObserver:
         from vllm.v1.core.sched.plex_verbs import PlexVerbs
 
         self._verbs = PlexVerbs.maybe(scheduler)
+        # How many eviction candidates to offer per step. A bound rather
+        # than the whole pool: the cost of describing pages has to stay
+        # proportional to how many the engine is about to touch, not to
+        # how many exist.
+        self._page_budget = int(os.environ.get("VLLM_PLEX_PAGE_BUDGET", "64"))
+        self._offered_last: set[str] = set()
         self._finished: list[list[str]] = []
 
     # ── the hooks, and there are two ─────────────────────────────────────
@@ -210,10 +216,51 @@ class PlexObserver:
         return {request.request_id for request in held()}
 
     def _subjects(self) -> dict[str, list[str]]:
-        return {
+        subjects = {
             "request": [request.request_id for request in self._tracked()],
             "target": [self._target],
         }
+        pages = self._offered_pages()
+        if pages:
+            subjects["page"] = [page_id for page_id, _ in pages]
+        return subjects
+
+    def _offered_pages(self) -> list[tuple[str, Any]]:
+        """Cached blocks that are candidates for eviction, coldest first.
+
+        **Offered, not enumerated.** A page-level snapshot of the whole
+        pool would be per-block state on every step, which is a different
+        order of cost from the per-request scrape the rest of this file
+        does — and it would hand a policy thousands of subjects to answer
+        about when the engine is only about to reuse a handful.
+
+        So this is the narrower question the contract already has a word
+        for: the pages the engine would take next. `free_block_queue` is
+        vLLM's own eviction order, so reading it is reading the answer
+        rather than modelling it.
+
+        Identity is the block's content hash where it has one, because
+        that is what makes a page the *same page* across steps — a
+        content-addressed name survives eviction and readmission, and a
+        hotness ledger keyed on it does not have to be reaped.
+        """
+        try:
+            pool = self._scheduler.kv_cache_manager.block_pool
+            queue = pool.free_block_queue
+        except AttributeError:
+            return []
+
+        offered: list[tuple[str, Any]] = []
+        block = getattr(queue, "fake_free_list_head", None)
+        block = getattr(block, "next_free_block", None) if block else None
+        seen = 0
+        while block is not None and seen < self._page_budget:
+            block_hash = getattr(block, "block_hash", None)
+            if block_hash is not None:
+                offered.append((f"p{hash(block_hash) & 0xFFFFFFFF:08x}", block))
+            block = getattr(block, "next_free_block", None)
+            seen += 1
+        return offered
 
     def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {request.request_id for request in self._scheduler.running}
@@ -250,6 +297,19 @@ class PlexObserver:
                 # side.
                 "waiting_ms": {"num": max(now_ms - int(request.arrival_time * 1000), 0)},
             }
+        for page_id, block in self._offered_pages():
+            facts[page_id] = {
+                # Resident, because an eviction candidate is by
+                # definition still in the pool — it is on the free list,
+                # not gone.
+                "resident": {"flag": True},
+                "targets": {"ids": [self._target]},
+                "tier": {"text": "gpu"},
+                "pinned": {"flag": getattr(block, "ref_cnt", 0) > 0},
+                "page-tokens": {
+                    "num": int(getattr(block, "_block_hash_num_tokens", 0) or 0)
+                },
+            }
         facts[self._target] = self._target_facts()
         return facts
 
@@ -257,15 +317,22 @@ class PlexObserver:
         scheduler = self._scheduler
         pool = scheduler.kv_cache_manager.block_pool
         block_size = scheduler.cache_config.block_size
-        total_blocks = pool.num_gpu_blocks
-        free_blocks = pool.get_num_free_blocks()
+        # `getattr` rather than attribute access: an engine build that
+        # names these differently must lose the facts, not the engine.
+        # A test caught this — a pool without `num_gpu_blocks` raised
+        # straight out of `emit_step`, and observation is never allowed
+        # to stop inference.
+        total_blocks = int(getattr(pool, "num_gpu_blocks", 0) or 0)
+        get_free = getattr(pool, "get_num_free_blocks", None)
+        free_blocks = int(get_free() if get_free else 0)
         running = list(scheduler.running)
         max_running = scheduler.max_num_running_reqs
         # Output tokens the engine still owes, and prompt tokens it has
         # yet to prefill. Both are sums over state the scheduler already
         # holds; neither is a model of anything.
         pending_decode = sum(
-            max(request.max_tokens - len(request.output_token_ids), 0)
+            max(int(getattr(request, "max_tokens", 0) or 0)
+                - len(request.output_token_ids), 0)
             for request in running
         )
         queued_tokens = sum(
@@ -311,6 +378,15 @@ class PlexObserver:
 
     def _events(self) -> dict[str, Any]:
         events: dict[str, Any] = {}
+        offered = [page_id for page_id, _ in self._offered_pages()]
+        # Only pages that were not offered last step. `on-offered` means
+        # "this is newly on the table", and re-raising it every step for
+        # the same page would make a cache policy count one offer as many
+        # — every accumulator in the corpus is vulnerable to that.
+        fresh = [page_id for page_id in offered if page_id not in self._offered_last]
+        if fresh:
+            events["offered"] = fresh
+        self._offered_last = set(offered)
         if self._admitted:
             events["admitted"] = list(self._admitted)
         if self._finished:
