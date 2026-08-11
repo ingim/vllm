@@ -49,6 +49,27 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def _page_id(block_hash: Any) -> str:
+    """A page's name, stable across processes.
+
+    `BlockHash` is a `bytes` newtype. Python randomises the hash of
+    `bytes` per interpreter, so `hash(block_hash)` names a different page
+    in every process — including between the engine that offers a page
+    and any later run that tries to name it back. The bytes themselves do
+    not move, so the id is taken from them.
+
+    Truncated to eight hex digits because the id is a *name*, not a
+    checksum: it identifies a page among the few dozen the engine offers
+    at once, and it is read by humans in traces.
+    """
+    if isinstance(block_hash, (bytes, bytearray)):
+        digest = bytes(block_hash)
+    else:
+        digest = str(block_hash).encode("utf-8")
+    value = int.from_bytes(digest[:8].ljust(8, b"\0"), "big") & 0xFFFFFFFF
+    return f"p{value:08x}"
+
+
 class PlexObserver:
     """One scheduler, in the contract's vocabulary. Holds no policy.
 
@@ -254,6 +275,16 @@ class PlexObserver:
         that is what makes a page the *same page* across steps — a
         content-addressed name survives eviction and readmission, and a
         hotness ledger keyed on it does not have to be reaped.
+
+        Derived from the hash **bytes**, not from `hash()` of them.
+        `BlockHash` is a `bytes` newtype and Python randomises the hash
+        of `bytes` per interpreter, so an id built that way is stable
+        within one process and meaningless between two. It read as
+        content-addressed and was process-addressed, which is the worst
+        version: a policy naming a page it saw last run names nothing,
+        silently, and the engine evicts exactly as it always would.
+        Measured that way, an eviction order that should have wrecked the
+        hit rate changed it by 0.0000.
         """
         try:
             pool = self._scheduler.kv_cache_manager.block_pool
@@ -268,7 +299,7 @@ class PlexObserver:
         while block is not None and seen < self._page_budget:
             block_hash = getattr(block, "block_hash", None)
             if block_hash is not None:
-                offered.append((f"p{hash(block_hash) & 0xFFFFFFFF:08x}", block))
+                offered.append((_page_id(block_hash), block))
             block = getattr(block, "next_free_block", None)
             seen += 1
         return offered

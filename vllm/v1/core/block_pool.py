@@ -12,6 +12,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.plex_cache import PlexEviction
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -179,6 +180,9 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+        # VLLM_PLEX_EVICT names a standing eviction order; see plex_cache.py.
+        self.plex_eviction = PlexEviction.maybe()
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -657,6 +661,10 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        if self.plex_eviction is not None:
+            self.plex_eviction.reload()
+            self.plex_eviction.prefer(self.free_block_queue)
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
