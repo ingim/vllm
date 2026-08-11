@@ -123,6 +123,7 @@ class PlexEviction:
         self._source = source if source else os.environ.get("VLLM_PLEX_EVICT")
         self._source_stamp: tuple[int, int] | None = None
         self._order: list[str] = []
+        self._rank: dict[str, int] = {}
         self.installs = 0
         # Pages named by the policy that were found in the free queue and
         # moved, against pages named at all. Reported rather than
@@ -177,26 +178,40 @@ class PlexEviction:
             order = document.get("evict")
             if isinstance(order, list):
                 self._order = [str(page) for page in order]
+                # Position of each page, so `_settled` can start from
+                # wherever the queue's cached region begins rather than
+                # only from the front.
+                self._rank = {page: i for i, page in enumerate(self._order)}
                 self.installs += 1
             return
 
     def _settled(self, queue: FreeKVCacheBlockQueue) -> bool:
-        """Is the queue already in the order the standing document asks?
+        """Is the cached region already the order, or a suffix of it?
 
-        The order is reinstalled far less often than the pool allocates
-        -- measured, 115 installs against thousands of allocations -- and
-        re-splicing an already-correct queue is pure cost. Checking is
-        O(named); splicing is O(pool), and doing the second on every
-        allocation cost 27-41% of latency.
+        A suffix, and that is the whole point. After one successful
+        splice the cached region begins with `order[0]`; the engine then
+        takes blocks off the head, so by the next allocation it begins
+        with `order[k]` for some k. Demanding a match from `order[0]`
+        fails on every call after the first, which is why the fast path
+        fired 8 to 36 times in two hundred allocations and the O(pool)
+        splice ran for the rest.
 
-        Cheap and exact: walk from the first cached block and see whether
-        the named pages are already there, in order. A single missing or
-        out-of-place page fails it and the full pass runs.
+        Matching from wherever the region actually starts costs one
+        dictionary lookup and then a walk as long as what remains.
         """
         block = first_cached(queue)
-        for page in self._order:
-            if block is None or block is queue.fake_free_list_tail:
-                return False
+        if block is None:
+            return True
+        identifier = page_id(block)
+        start = self._rank.get(identifier) if identifier else None
+        if start is None:
+            return False
+        tail = queue.fake_free_list_tail
+        for page in self._order[start:]:
+            if block is None or block is tail:
+                # The order outruns the queue: everything still present
+                # is in the right place and the rest has been taken.
+                return True
             if page_id(block) != page:
                 return False
             block = block.next_free_block
