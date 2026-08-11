@@ -74,6 +74,43 @@ def page_id(block: Any) -> str | None:
     return _page_id(block_hash)
 
 
+def first_cached(queue: FreeKVCacheBlockQueue) -> Any:
+    """The first block in the queue that holds cached content.
+
+    Everything before it has no hash and costs nothing to take, which is
+    the invariant `free_blocks` maintains by prepending unhashed blocks
+    and appending hashed ones. An eviction order is about the cached
+    part; the free part is not a decision.
+    """
+    block = queue.fake_free_list_head.next_free_block
+    tail = queue.fake_free_list_tail
+    while block is not None and block is not tail:
+        if getattr(block, "block_hash", None) is not None:
+            return block
+        block = block.next_free_block
+    return None
+
+
+def splice_before(queue: FreeKVCacheBlockQueue, anchor: Any, blocks: list) -> None:
+    """Insert `blocks`, in order, immediately before `anchor`.
+
+    The queue has no insert-at-position, and building one out of
+    `remove` plus `prepend_n` is what put cached pages ahead of unused
+    ones. The links are set directly and `num_free_blocks` is restored
+    by hand, because `remove` decremented it for each block taken out.
+    """
+    if not blocks:
+        return
+    previous = anchor.prev_free_block
+    for block in blocks:
+        block.prev_free_block = previous
+        previous.next_free_block = block
+        previous = block
+    previous.next_free_block = anchor
+    anchor.prev_free_block = previous
+    queue.num_free_blocks += len(blocks)
+
+
 class PlexEviction:
     """A standing eviction order, applied at the moment the pool reads.
 
@@ -95,6 +132,10 @@ class PlexEviction:
         self.named = 0
         self.applied = 0
         self.calls = 0
+        # Allocations where the queue already matched the order. The
+        # difference between this and `calls` is how much work the
+        # attachment avoided.
+        self.settled = 0
 
     @staticmethod
     def maybe() -> PlexEviction | None:
@@ -139,6 +180,28 @@ class PlexEviction:
                 self.installs += 1
             return
 
+    def _settled(self, queue: FreeKVCacheBlockQueue) -> bool:
+        """Is the queue already in the order the standing document asks?
+
+        The order is reinstalled far less often than the pool allocates
+        -- measured, 115 installs against thousands of allocations -- and
+        re-splicing an already-correct queue is pure cost. Checking is
+        O(named); splicing is O(pool), and doing the second on every
+        allocation cost 27-41% of latency.
+
+        Cheap and exact: walk from the first cached block and see whether
+        the named pages are already there, in order. A single missing or
+        out-of-place page fails it and the full pass runs.
+        """
+        block = first_cached(queue)
+        for page in self._order:
+            if block is None or block is queue.fake_free_list_tail:
+                return False
+            if page_id(block) != page:
+                return False
+            block = block.next_free_block
+        return True
+
     def prefer(self, queue: FreeKVCacheBlockQueue) -> int:
         """Move the policy's victims to the head of the free queue.
 
@@ -147,6 +210,11 @@ class PlexEviction:
         a read may happen mid-pass, a write may not, and this is a write.
         """
         if not self._order:
+            return 0
+
+        self.calls += 1
+        if self._settled(queue):
+            self.settled += 1
             return 0
 
         # Walk the queue once, building only the mapping the order needs.
@@ -164,14 +232,39 @@ class PlexEviction:
 
         victims = [found[page] for page in self._order if page in found]
         self.named += len(self._order)
-        self.calls += 1
         if not victims:
             self._report()
             return 0
 
+        # Spliced in front of the first *cached* block, not in front of
+        # the queue.
+        #
+        # vLLM's `free_blocks` prepends blocks with no hash and appends
+        # blocks with one, so the queue is [never-used ... cached] and
+        # the engine spends the never-used blocks first. Prepending to
+        # the head puts cached pages ahead of blocks that cost nothing to
+        # take, and the engine then evicts cache it did not have to.
+        #
+        # Measured, and it is the dominant term: an order naming exactly
+        # what LRU was going to evict anyway -- the identity order, which
+        # should be free -- cost 0.0097 of hit rate, against 0.0133 for a
+        # deliberately hostile one. Two thirds of what looked like the
+        # policies' bad judgement was this.
+        # By object identity, not by membership. `KVCacheBlock` defines
+        # `__eq__` without `__hash__`, so it is unhashable and `in set(...)`
+        # raises -- which killed the engine on the first allocation. The
+        # offline test used a stand-in class that was hashable and could
+        # not have caught it.
+        anchor = first_cached(queue)
+        taken = {id(victim) for victim in victims}
         for victim in victims:
             queue.remove(victim)
-        queue.prepend_n(victims)
+        if anchor is None or id(anchor) in taken:
+            anchor = first_cached(queue)
+        if anchor is None:
+            queue.append_n(victims)
+        else:
+            splice_before(queue, anchor, victims)
 
         self.applied += len(victims)
         self._report()
@@ -192,8 +285,8 @@ class PlexEviction:
             return
         print(
             f"[plex-cache] calls={self.calls} named={self.named} "
-            f"applied={self.applied} order={len(self._order)} "
-            f"installs={self.installs}",
+            f"applied={self.applied} settled={self.settled} "
+            f"order={len(self._order)} installs={self.installs}",
             file=sys.stderr,
             flush=True,
         )
