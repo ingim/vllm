@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -70,6 +71,35 @@ class PlexRequestQueue(RequestQueue):
         # be able to fail because one is slow.
         self._source = source if source else os.environ.get("VLLM_PLEX_TABLE")
         self._source_stamp: tuple[int, int] | None = None
+
+        # ── admission hold (the route channel) ───────────────────────────
+        #
+        # A gate rules on requests that have arrived and have not yet been
+        # admitted. vLLM has no such state: `add_request` puts a request
+        # straight into the waiting queue, so a policy answering `reject`
+        # would be answering about something already accepted.
+        #
+        # Holding arrivals here creates the state the verdict is about.
+        # It is a behaviour change and therefore stage 2, which is where
+        # it belongs: admission control that cannot withhold admission is
+        # not admission control.
+        self._gate = os.environ.get("VLLM_PLEX_GATE")
+        self._held: dict[str, tuple[Request, float]] = {}
+        self._verdict_stamp: tuple[int, int] | None = None
+        # How long a request may be held with no verdict.
+        #
+        # Not optional, and not large. If the bridge dies, every held
+        # request would otherwise be stranded forever — a far worse
+        # failure than a stale table, because a stale table still serves
+        # everyone. `hooks.md` pairs a deadline with a *declared default*
+        # so that silence and slowness produce the same behaviour, and
+        # the declared default here is the engine's own: admit.
+        #
+        # Admit rather than reject because stage 1's principle carries
+        # forward — a policy that does not answer must not change what
+        # the engine would have done.
+        self._hold_ms = float(os.environ.get("VLLM_PLEX_GATE_MS", "50"))
+        self.released_by_deadline = 0
         # request id -> rank. Replaced wholesale on install: a table is a
         # document, not a stream of edits, so a partially-applied one is
         # not representable.
@@ -81,6 +111,10 @@ class PlexRequestQueue(RequestQueue):
         self._installs = 0
         self._arrivals = 0
         self._installed_at_arrival = 0
+        # Requests a policy refused entry. Kept rather than counted: the
+        # engine has to answer the caller, and "rejected by policy" is a
+        # different answer from "failed".
+        self.rejected_by_policy: list[str] = []
 
     # ── the standing table ───────────────────────────────────────────────
 
@@ -159,8 +193,98 @@ class PlexRequestQueue(RequestQueue):
             return
         self.install([str(entry) for entry in order])
 
+    # ── the gate ─────────────────────────────────────────────────────────
+
+    def _pick_up_verdicts(self) -> None:
+        """Apply any verdicts the policy has written.
+
+        `{"request-id": "assign"|"defer"|"reject"}`. A verdict names a
+        request the gate was offered; anything else is ignored, because a
+        policy ruling on a request this engine does not hold has stale
+        beliefs and acting on it would be acting on someone else's world.
+        """
+        if not self._gate:
+            return
+        try:
+            stat = os.stat(self._gate)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._verdict_stamp:
+                return
+            with open(self._gate, encoding="utf-8") as handle:
+                verdicts = json.load(handle)
+            if not isinstance(verdicts, dict):
+                return
+            self._verdict_stamp = stamp
+        except (OSError, ValueError):
+            return
+
+        for request_id, verdict in verdicts.items():
+            entry = self._held.get(str(request_id))
+            if entry is None:
+                continue
+            request, _ = entry
+            if verdict == "assign":
+                del self._held[str(request_id)]
+                self._requests.append(request)
+            elif verdict == "reject":
+                # Released *and* recorded, not dropped.
+                #
+                # A first version deleted the request from the hold and
+                # queued nothing. The engine hung: the caller was still
+                # waiting for an answer that no longer had any code path
+                # to produce. A refusal is a kind of *ending*, not a kind
+                # of forgetting, and a request that vanishes without an
+                # outcome is worse than one that is served.
+                #
+                # So it goes back into the queue and its id is recorded;
+                # the observer reports it and the scheduler ends it
+                # through the engine's own terminal path. `reject` stays
+                # a verdict rather than a verb because the decision is
+                # about *entry* — no standing table can say "never" — but
+                # enacting it still has to use the one way this engine
+                # finishes things.
+                del self._held[str(request_id)]
+                self._requests.append(request)
+                self.rejected_by_policy.append(str(request_id))
+            # `defer` keeps it held, which is the whole point of `defer`.
+
+    def _release_expired(self) -> None:
+        """Admit anything held past the deadline.
+
+        The declared default. A policy that never answers and a policy
+        that answers slowly produce the same behaviour, and that
+        behaviour is what the engine would have done unaided.
+        """
+        if not self._held:
+            return
+        now = time.monotonic()
+        expired = [
+            request_id
+            for request_id, (_, since) in self._held.items()
+            if (now - since) * 1000.0 >= self._hold_ms
+        ]
+        for request_id in expired:
+            request, _ = self._held.pop(request_id)
+            self._requests.append(request)
+            self.released_by_deadline += 1
+
+    def held_requests(self) -> list[Request]:
+        """Requests awaiting a verdict — the contract's `pending`."""
+        return [request for request, _ in self._held.values()]
+
+    def _gate_tick(self) -> None:
+        self._pick_up_verdicts()
+        self._release_expired()
+
+    # ── RequestQueue ─────────────────────────────────────────────────────
+
     def add_request(self, request: Request) -> None:
         self._arrivals += 1
+        if self._gate:
+            # Held rather than queued: this is the moment a gate rules
+            # on, and it does not otherwise exist in vLLM.
+            self._held[request.request_id] = (request, time.monotonic())
+            return
         self._requests.append(request)
         self._resort()
 
@@ -193,9 +317,32 @@ class PlexRequestQueue(RequestQueue):
         )
 
     def __bool__(self) -> bool:
+        # The hold is advanced here, and its result is what is reported.
+        #
+        # Two wrong versions came first, and both were instructive.
+        #
+        # Reporting only `bool(self._requests)` **hung a real engine**:
+        # with every arrival held the queue looked empty, the scheduler
+        # concluded there was nothing to do and stopped stepping, so the
+        # observer stopped running, so the deadline never advanced, so
+        # nothing was ever released. A deadline only checked while the
+        # engine is busy is not a deadline.
+        #
+        # Reporting `_requests or _held` **crashed it**: the scheduler
+        # believed there was work, called `peek_request`, and found an
+        # empty deque. Held is not schedulable — that is the entire
+        # point of holding it.
+        #
+        # So: tick first, then answer about what is genuinely
+        # schedulable. The tick is what makes the declared default real;
+        # the answer is what keeps the engine's own contract.
+        if self._held:
+            self._gate_tick()
         return bool(self._requests)
 
     def __len__(self) -> int:
+        if self._held:
+            self._gate_tick()
         return len(self._requests)
 
     def __iter__(self) -> Iterator[Request]:

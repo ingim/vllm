@@ -121,8 +121,27 @@ class PlexObserver:
             self._sink = None
             self._scheduler.plex_observer = None
 
+    def _finish_rejected(self) -> None:
+        """End requests the gate refused, through the engine's own path.
+
+        `reject` is the one entry decision no standing table can express,
+        but enacting it still has to use the single way this engine
+        finishes a request. Doing it here — between passes, with the
+        verbs — keeps it on the write-safe side of the rule two crashes
+        established.
+        """
+        queue = self._scheduler.waiting
+        refused = getattr(queue, "rejected_by_policy", None)
+        if not refused:
+            return
+        ids = list(refused)
+        refused.clear()
+        from vllm.v1.request import RequestStatus
+
+        self._scheduler.finish_requests(ids, RequestStatus.FINISHED_ABORTED)
+
     def drain_verbs(self) -> int:
-        """Enact staged verbs. Called before a scheduling pass begins.
+        """Enact staged verbs and refusals. Called before a pass begins.
 
         Separate from `on_step` because a verb is a *write* and the
         observer's hook sits inside `schedule()`. `pause` removes from
@@ -131,6 +150,13 @@ class PlexObserver:
         second time a PLEX write applied at the wrong moment has crashed
         a real engine. Observation is safe mid-pass; writes are not.
         """
+        # Refusals go here too. `finish_requests` mutates the same
+        # bookkeeping `schedule()` builds its lists from, and doing it at
+        # the observer's step hook — which is *inside* `schedule()` —
+        # tripped the engine's assert on resumed requests for the third
+        # time. Third occurrence, same cause, same fix: writes belong
+        # before the pass.
+        self._finish_rejected()
         if self._verbs is None:
             return 0
         return self._verbs.drain()
@@ -146,6 +172,12 @@ class PlexObserver:
         reload_table = getattr(self._scheduler.waiting, "reload", None)
         if reload_table is not None:
             reload_table()
+        # Verdicts and the hold deadline advance here too: a released
+        # request joins the schedulable set, which is a write, and this
+        # is between passes.
+        gate_tick = getattr(self._scheduler.waiting, "_gate_tick", None)
+        if gate_tick is not None:
+            gate_tick()
         self._step += 1
         document_now_ms = int(time.time() * 1000)
         document = {
@@ -164,7 +196,18 @@ class PlexObserver:
 
     def _tracked(self) -> list[Request]:
         scheduler = self._scheduler
-        return [*scheduler.waiting, *scheduler.running]
+        held = getattr(scheduler.waiting, "held_requests", None)
+        return [
+            *(held() if held is not None else []),
+            *scheduler.waiting,
+            *scheduler.running,
+        ]
+
+    def _held_ids(self) -> set[str]:
+        held = getattr(self._scheduler.waiting, "held_requests", None)
+        if held is None:
+            return set()
+        return {request.request_id for request in held()}
 
     def _subjects(self) -> dict[str, list[str]]:
         return {
@@ -174,6 +217,7 @@ class PlexObserver:
 
     def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {request.request_id for request in self._scheduler.running}
+        held_ids = self._held_ids()
         facts: dict[str, dict[str, Any]] = {}
         for request in self._tracked():
             running = request.request_id in running_ids
@@ -181,7 +225,16 @@ class PlexObserver:
             computed = request.num_computed_tokens
             generated = len(request.output_token_ids)
             facts[request.request_id] = {
-                "state": {"text": "active" if running else "admitted"},
+                # `pending` only when the request is genuinely being
+                # held out of the schedulable set. Publishing it for a
+                # queued request would be a lie: the engine has already
+                # accepted that one, and a policy answering `reject`
+                # would be ruling on something already admitted.
+                "state": {
+                    "text": "pending"
+                    if request.request_id in held_ids
+                    else ("active" if running else "admitted")
+                },
                 "arrival_seq": {"num": self._arrival_seq.get(request.request_id, 0)},
                 "arrival_ms": {"num": int(request.arrival_time * 1000)},
                 "prompt_tokens": {"num": prompt},
@@ -189,7 +242,7 @@ class PlexObserver:
                 "computation_length": {"num": prompt + generated},
                 "dispatch_input_tokens": {"num": max(prompt - computed, 0)},
                 "cached_tokens": {"num": computed},
-                "queue_member": {"flag": not running},
+                "queue_member": {"flag": not running and request.request_id not in held_ids},
                 "preempted": {"flag": request.num_preemptions > 0},
                 # How long it has been here. The engine holds both
                 # operands and the port holds neither, which is the

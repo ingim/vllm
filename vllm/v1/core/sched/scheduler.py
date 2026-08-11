@@ -2327,6 +2327,18 @@ class Scheduler(SchedulerInterface):
         return len(self.requests) > num_in_queues
 
     def has_requests(self) -> bool:
+        # PLEX v2 stage-2: a held request is pending work.
+        #
+        # The engine quiesces when it believes there is nothing to do. A
+        # request held for a verdict is not schedulable, but it is not
+        # nothing — and if the engine sleeps, the hold deadline never
+        # advances and a silent policy becomes a hung engine.
+        #
+        # This is the same reason the connector clause below exists, and
+        # it is one line for the same one-line reason.
+        if getattr(self.waiting, "held_requests", None) and self.waiting.held_requests():
+            return True
+
         # Override the interface default to also keep the engine alive while a
         # connector still has pending push work (e.g. push-mode WRITE transfers
         # in flight after all "live" requests have finished). Without this hook
