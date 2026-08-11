@@ -82,6 +82,11 @@ class PlexObserver:
         # proportional to how many the engine is about to touch, not to
         # how many exist.
         self._page_budget = int(os.environ.get("VLLM_PLEX_PAGE_BUDGET", "64"))
+        # A short window of observed step durations, for the timing
+        # facts. Bounded so it tracks the engine's current behaviour
+        # rather than averaging over a run whose shape has changed.
+        self._step_ms_window: list[int] = []
+        self._last_step_ms: int | None = None
         self._offered_last: set[str] = set()
         self._finished: list[list[str]] = []
 
@@ -186,6 +191,11 @@ class PlexObserver:
             gate_tick()
         self._step += 1
         document_now_ms = int(time.time() * 1000)
+        if self._last_step_ms is not None:
+            self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
+            if len(self._step_ms_window) > 32:
+                self._step_ms_window.pop(0)
+        self._last_step_ms = document_now_ms
         document = {
             "step": self._step,
             "now-ms": document_now_ms,
@@ -296,6 +306,15 @@ class PlexObserver:
                 # standing test for whether a derivation belongs on this
                 # side.
                 "waiting_ms": {"num": max(now_ms - int(request.arrival_time * 1000), 0)},
+                # The same quantity the corpus also reads under a
+                # second name. Published rather than left absent:
+                # a policy reading it gets `unknown-key` and
+                # silently takes a default.
+                "current_queue_ms": {
+                    "num": 0
+                    if running
+                    else max(now_ms - int(request.arrival_time * 1000), 0)
+                },
             }
         for page_id, block in self._offered_pages():
             facts[page_id] = {
@@ -313,6 +332,33 @@ class PlexObserver:
         facts[self._target] = self._target_facts()
         return facts
 
+
+    def _step_timing(self) -> tuple[int, int]:
+        """Median step wall clock, and the decode cost it implies.
+
+        **Measured here, not read from the engine.** Neither engine keeps
+        a per-step duration an observer can read — `forward_ct` is a
+        count — and the honest options were to publish nothing or to
+        measure. Publishing nothing loses four names the corpus reads;
+        inventing a plausible constant would hand a policy a confident
+        number about a machine nobody timed.
+
+        So the observer times its own steps and says so. It is the
+        *observer's* view of the step, which includes anything else the
+        engine did between two documents — and that is the quantity a
+        policy reasoning about "how long until my turn" actually wants.
+
+        Median over a short window rather than a mean: one slow step
+        (a cold kernel, a neighbour on the GPU) would drag a mean for
+        many steps afterwards, and a policy acting on it would be acting
+        on an outlier that has already passed.
+        """
+        if len(self._step_ms_window) < 3:
+            return (0, 0)
+        window = sorted(self._step_ms_window)
+        median = window[len(window) // 2]
+        return (median, median * 1000)
+
     def _target_facts(self) -> dict[str, Any]:
         scheduler = self._scheduler
         pool = scheduler.kv_cache_manager.block_pool
@@ -326,7 +372,9 @@ class PlexObserver:
         get_free = getattr(pool, "get_num_free_blocks", None)
         free_blocks = int(get_free() if get_free else 0)
         running = list(scheduler.running)
-        max_running = scheduler.max_num_running_reqs
+        max_running = int(getattr(scheduler, "max_num_running_reqs", 0) or 0)
+        queued = len(scheduler.waiting)
+        step_ms, step_us = self._step_timing()
         # Output tokens the engine still owes, and prompt tokens it has
         # yet to prefill. Both are sums over state the scheduler already
         # holds; neither is a model of anything.
@@ -360,6 +408,30 @@ class PlexObserver:
                 else 0
             },
             "kv_overloaded": {"flag": free_blocks < total_blocks / 10},
+            "step_ms": {"num": step_ms},
+            # Time per output token, from the observer's own timing. The
+            # engine keeps no such number, so this is measured rather
+            # than read — and it is the observer's view of a step, which
+            # is what a policy asking "how long until my turn" wants.
+            "decode_ms_per_token": {"num": step_ms},
+            "tpot_us": {"num": step_us},
+            # How long a newcomer waits: the requests ahead of it,
+            # divided by how many run at once, times a step.
+            "estimated_wait_ms": {
+                "num": ((queued + max_running - 1) // max_running) * step_ms if max_running else 0
+            },
+            # Guarantee 4: the tier vocabulary is declared, never guessed.
+            # vLLM's v1 scheduler has no CPU-offload path a port may
+            # drive, so it has exactly one tier and says so — which is a
+            # different statement from publishing nothing and letting a
+            # policy assume whatever its paper assumed.
+            "tiers": {"ids": ["gpu"]},
+            # The engine's own ceiling on work per step. Read, not
+            # modelled: `max_num_scheduled_tokens` is exactly the budget
+            # the scheduler spends.
+            "throughput_token_cap": {
+                "num": int(getattr(scheduler, "max_num_scheduled_tokens", 0) or 0)
+            },
             "used_kv_ppm": {
                 "num": min(
                     (total_blocks - free_blocks) * 1_000_000 // total_blocks,
