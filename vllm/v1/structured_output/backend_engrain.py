@@ -305,6 +305,28 @@ class EngrainBackend(StructuredOutputBackend):
                             words=compiled.bitset_words,
                             stop_token_ids=self.stop_token_ids,
                         )
+                    except (torch.cuda.OutOfMemoryError, MemoryError) as refusal:
+                        # The arena shares the device with the model and its KV
+                        # cache, and the eviction policy will go over budget
+                        # rather than refuse a request - so the allocator is
+                        # what says no, in the middle of admitting. `admit`
+                        # unwinds, and this is the only place that can decide
+                        # what to do instead: run the schema on the reference
+                        # matcher. Killing the request, or the engine, because
+                        # the *fast path* ran out of room is the wrong trade
+                        # when a correct slower path is right here.
+                        logger.warning(
+                            "engrain: the grammar tables would not fit on the "
+                            "device (%s). That schema runs on the reference "
+                            "matcher; everything already resident is "
+                            "untouched.",
+                            refusal,
+                        )
+                        return EngrainGrammar(
+                            matcher=compiled.matcher(_MATCHER_ROLLBACK),
+                            words=compiled.bitset_words,
+                            stop_token_ids=self.stop_token_ids,
+                        )
                     self.grammar_ids[key] = (identifier, self.pool.generation(identifier))
                 identifier, generation = self.grammar_ids[key]
                 # Pinned here, under the lock that resolved it, rather than in
