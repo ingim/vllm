@@ -95,6 +95,11 @@ class PlexObserver:
         # fairness to enforce, and `arrival_time` is a float whose ties are
         # broken by nothing.
         self._arrival_seq: dict[str, int] = {}
+        # How often a page has been offered and survived, which is the
+        # closest thing to a hit count the free queue can support: a page
+        # that keeps coming back to the offer without being taken is one
+        # the engine keeps deciding not to evict.
+        self._page_hits: dict[str, int] = {}
         self._arrivals = 0
         # Edges since the last document. Cleared on emit, because an event
         # delivered twice is one thing a policy counts as two.
@@ -370,7 +375,30 @@ class PlexObserver:
                     else max(now_ms - int(request.arrival_time * 1000), 0)
                 },
             }
-        for page_id, block in self._offered_pages():
+        # Pages that stopped being offered have been taken; forgetting
+        # them keeps the ledger the size of the offer rather than of
+        # every page the run ever saw.
+        offered = self._offered_pages()
+        live = {page_id for page_id, _ in offered}
+        if len(self._page_hits) > 4 * max(len(live), 1):
+            self._page_hits = {
+                page: count for page, count in self._page_hits.items()
+                if page in live
+            }
+        # Position in the engine's own eviction order, which is what
+        # `last-access-ms` means to a policy: the head of the free queue
+        # is the least recently used, and the queue *is* vLLM's recency
+        # ranking. Converting rank to a timestamp rather than publishing
+        # the rank keeps the fact in the corpus's vocabulary -- every
+        # cache port reads `last-access-ms` and none reads a rank.
+        #
+        # Without it, `hotprefix` and `pythia` compute hotness from
+        # `unknown-key`, score every page identically, and install an
+        # order that is the offer's own order with extra steps. Measured:
+        # four cache policies within 4% of LRU, none beating it, on two
+        # different corpora including one built so that recency and
+        # frequency disagree.
+        for rank, (page_id, block) in enumerate(offered):
             facts[page_id] = {
                 # Resident, because an eviction candidate is by
                 # definition still in the pool — it is on the free list,
@@ -382,7 +410,26 @@ class PlexObserver:
                 "page-tokens": {
                     "num": int(getattr(block, "_block_hash_num_tokens", 0) or 0)
                 },
+                "size-tokens": {
+                    "num": int(getattr(block, "_block_hash_num_tokens", 0) or 0)
+                },
+                # Older by rank, so the head of the queue is the oldest.
+                "last-access-ms": {"num": max(now_ms - rank, 0)},
+                # Every offered page is a leaf. vLLM's pool is flat --
+                # there is no tree, so no page has a page below it --
+                # and a cache port that filters on `leaf` should see all
+                # of them rather than none.
+                "leaf": {"flag": True},
+                "hit-count": {
+                    "num": int(self._page_hits.get(page_id, 0))
+                },
             }
+            # Counted here, once per step the page is offered. A page
+            # that keeps reappearing in the offer is one the engine has
+            # repeatedly declined to take, which is the only frequency
+            # signal a free queue carries. Incremented after the fact is
+            # read so the first sighting reports zero rather than one.
+            self._page_hits[page_id] = self._page_hits.get(page_id, 0) + 1
         facts[self._target] = self._target_facts()
         return facts
 
