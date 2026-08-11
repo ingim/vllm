@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -109,6 +110,11 @@ class PlexRequestQueue(RequestQueue):
         # a queue that no longer exists is visible — v0.7 had one arm's
         # plan running 222 arrivals stale and no way to see it.
         self._installs = 0
+        # Instrumentation; see `_resort`.
+        self.resorts = 0
+        self.queued = 0
+        self.ranked = 0
+        self.moved = 0
         self._arrivals = 0
         self._installed_at_arrival = 0
         # Requests a policy refused entry. Kept rather than counted: the
@@ -151,8 +157,33 @@ class PlexRequestQueue(RequestQueue):
         return (0, rank, request.arrival_time)
 
     def _resort(self) -> None:
+        before = [request.request_id for request in self._requests]
         ordered = sorted(self._requests, key=self._sort_key)
         self._requests = deque(ordered)
+
+        # Did the table actually move anything?
+        #
+        # `decision alone = 1.000x` has two explanations that look
+        # identical from outside: the engine honoured an order that
+        # happened not to matter, or the engine never had one to honour.
+        # The counters separate them. `ranked` is how many of the queued
+        # requests the policy named -- a policy ranking none of them has
+        # decided nothing whatever the metric says -- and `moved` is how
+        # many changed position, which is the reordering the engine
+        # actually performed.
+        after = [request.request_id for request in self._requests]
+        self.resorts += 1
+        self.ranked += sum(1 for rid in before if rid in self._rank)
+        self.queued += len(before)
+        self.moved += sum(1 for a, b in zip(before, after) if a != b)
+        if self.resorts % 50 == 0:
+            print(
+                f"[plex-queue] resorts={self.resorts} queued={self.queued} "
+                f"ranked={self.ranked} moved={self.moved} "
+                f"installs={self._installs} table={len(self._rank)}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # ── RequestQueue ─────────────────────────────────────────────────────
 
