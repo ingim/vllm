@@ -49,6 +49,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def _client_of(request_id: str) -> str:
+    """The tenant a request belongs to, from the caller's own id."""
+    head, sep, _ = request_id.partition("::")
+    return head if sep else request_id
+
+
 def _page_id(block_hash: Any) -> str:
     """A page's name, stable across processes.
 
@@ -325,6 +331,22 @@ class PlexObserver:
                     else ("active" if running else "admitted")
                 },
                 "arrival_seq": {"num": self._arrival_seq.get(request.request_id, 0)},
+                # Who the request belongs to.
+                #
+                # vLLM has no tenant concept, so this is the caller's own
+                # label: whatever precedes the first `::` in the request
+                # id, and the whole id when there is no separator. A
+                # front end that wants fairness across tenants says so by
+                # naming them, which is the only place the information
+                # exists -- an engine cannot invent an ownership it was
+                # never told about.
+                #
+                # Without it every request reports the same client and a
+                # fairness policy sees one tenant. Measured on `vtc`:
+                # baseline and treatment arms byte-identical at a gap of
+                # 7.000, because the policy had nothing to be fair
+                # between.
+                "client_id": {"text": _client_of(request.request_id)},
                 "arrival_ms": {"num": int(request.arrival_time * 1000)},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
