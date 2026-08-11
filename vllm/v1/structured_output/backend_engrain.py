@@ -175,6 +175,17 @@ class EngrainBackend(StructuredOutputBackend):
         self.table_budget_bytes = int(
             os.environ.get("ENGRAIN_TABLE_BUDGET_MB", "1024")
         ) * (1 << 20)
+        # Whether a grammar arrives with all of its lexer states' groups on the
+        # device or only the one a parse starts in. Off by default: it trades
+        # device memory for a step of reference matching per state a document
+        # reaches for the first time, and which side of that a deployment wants
+        # depends on how much memory it has and how long its documents are.
+        #
+        # Over 64 corpus schemas a document reaches 3.5% of the lexer states,
+        # and the arena is 524.6 MiB against 200.6 - 2.61x. Not 28x: the states
+        # a parse reaches carry about twice an average state's groups, and the
+        # arrays that are not groups are a floor.
+        self._partial = os.environ.get("ENGRAIN_PARTIAL") == "1"
         # Digits an unbounded number may run to. Off by default, because it
         # narrows the language the schema asks for and this engine will not do
         # that on its own. It is here because a model handed a mask that still
@@ -284,7 +295,16 @@ class EngrainBackend(StructuredOutputBackend):
                 # even when the tables are not.
                 if held is None or not self.pool.holds(*held):
                     try:
-                        identifier = self.pool.admit(compiled)
+                        if self._partial:
+                            # The state a parse starts in, and nothing else.
+                            # Everything a document reaches after that arrives
+                            # through `_widen`, which the device's own flag
+                            # asks for.
+                            identifier = self.pool.admit(
+                                compiled, states=(compiled.start_lexer_state,)
+                            )
+                        else:
+                            identifier = self.pool.admit(compiled)
                     except WindowTooWide as refusal:
                         # This grammar would size every row of every batch for
                         # itself - the replay window is 95% of a batch's memory
@@ -468,8 +488,64 @@ class EngrainBackend(StructuredOutputBackend):
                 if narrowed[row]:
                     grammar.fill_bitmask(bitmask, index)
             self._warn_narrowed(int(narrowed.sum()))
+            self._widen(rows, narrowed)
         if os.environ.get("ENGRAIN_VERIFY"):
             self._verify(rows, host, narrowed)
+
+    def _widen(self, rows, narrowed) -> None:
+        """Give the pool the lexer states the refused rows are actually in.
+
+        Only does anything when grammars are admitted partly resident. A row
+        the device could not answer has already been answered exactly, from the
+        matcher; this is what stops it happening again, and it is the whole
+        demand-filling loop - the flag names the work, and the work is a copy
+        from an artifact that never left the host.
+
+        Gathered across the step and applied once per grammar: widening moves
+        arrays, so it re-records the recorded graphs, and doing that per
+        refused row would pay for it as many times as there were rows.
+
+        A row can also be flagged because its replay met a ceiling, which
+        widening does not fix. Asking for the states it is in is then a copy
+        that changes nothing, and the alternative - telling the two apart on
+        the device - is a second flag for no gain: a state already resident is
+        not in the set, so the widen is skipped anyway.
+        """
+        if self.pool is None or not self._partial:
+            return
+        import time
+
+        started = time.perf_counter()
+        wanted: dict[int, set[int]] = {}
+        with self.lock:
+            for row, (grammar, _index) in enumerate(rows):
+                if not narrowed[row] or grammar.grammar_id is None:
+                    continue
+                held = self.pool.resident_states(grammar.grammar_id)
+                if held is None:
+                    continue
+                for lexer, _stack in grammar.matcher.configurations():
+                    if lexer not in held:
+                        wanted.setdefault(grammar.grammar_id, set()).add(lexer)
+            for identifier, states in wanted.items():
+                fresh = self.pool.widen(identifier, states)
+                if fresh == identifier:
+                    continue
+                # A widening re-admits, which takes an identifier from the free
+                # list - usually the one just released, but a caller cannot
+                # assume it. Everything holding the old number has to be told,
+                # or a request is masked against whatever took the slot.
+                for grammar, _index in rows:
+                    if grammar.grammar_id == identifier:
+                        grammar.grammar_id = fresh
+                        grammar.generation = self.pool.generation(fresh)
+                for key, (held_id, _generation) in list(self.grammar_ids.items()):
+                    if held_id == identifier:
+                        self.grammar_ids[key] = (fresh, self.pool.generation(fresh))
+            if wanted:
+                # The assignment the batch holds names the old identifiers.
+                self._assigned = None
+        self._phase("widen", time.perf_counter() - started)
 
     def _phase(self, name: str, elapsed: float) -> None:
         """Accumulate where a step goes, when asked. Off by default.
