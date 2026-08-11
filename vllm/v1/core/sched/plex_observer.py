@@ -306,13 +306,33 @@ class PlexObserver:
         offered: list[tuple[str, Any]] = []
         block = getattr(queue, "fake_free_list_head", None)
         block = getattr(block, "next_free_block", None) if block else None
-        seen = 0
-        while block is not None and seen < self._page_budget:
+        tail = getattr(queue, "fake_free_list_tail", None)
+        # The budget bounds the **offer**, and the walk is bounded
+        # separately.
+        #
+        # It used to bound the walk, and the two are not the same on this
+        # queue: `free_blocks` prepends blocks with no hash and appends
+        # blocks with one, so a pool with plenty of never-used blocks
+        # puts them all in front. The budget was spent walking blocks
+        # that are not pages, and the offer came back empty or short --
+        # measured, zero pages offered on a fresh pool where thousands
+        # of cached blocks sat further down.
+        #
+        # A policy that is offered nothing decides nothing, and it
+        # reports no difficulty while doing it.
+        walk_limit = max(self._page_budget * 16, 4096)
+        walked = 0
+        while (
+            block is not None
+            and block is not tail
+            and len(offered) < self._page_budget
+            and walked < walk_limit
+        ):
             block_hash = getattr(block, "block_hash", None)
             if block_hash is not None:
                 offered.append((_page_id(block_hash), block))
             block = getattr(block, "next_free_block", None)
-            seen += 1
+            walked += 1
         return offered
 
     def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
