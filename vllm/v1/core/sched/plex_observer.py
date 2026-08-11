@@ -88,6 +88,7 @@ class PlexObserver:
         self._step_ms_window: list[int] = []
         self._last_step_ms: int | None = None
         self._offered_last: set[str] = set()
+        self._bytes_per_token = int(os.environ.get("VLLM_PLEX_BYTES_PER_TOKEN", "0"))
         self._finished: list[list[str]] = []
 
     # ── the hooks, and there are two ─────────────────────────────────────
@@ -426,6 +427,22 @@ class PlexObserver:
             # different statement from publishing nothing and letting a
             # policy assume whatever its paper assumed.
             "tiers": {"ids": ["gpu"]},
+            # The pool in bytes as well as tokens. Declared rather than
+            # derived: bytes-per-token depends on the model's layers,
+            # heads and dtype, and vLLM's scheduler holds the block size
+            # but not the byte size. A port that assumed one would
+            # publish a confident figure for a different model.
+            #
+            # Zero when undeclared, which reads as "no bytes accounted"
+            # rather than as a small pool — and a policy comparing it
+            # against a capacity gets a ratio of zero rather than a wrong
+            # one.
+            "memory_capacity": {
+                "num": total_blocks * block_size * self._bytes_per_token
+            },
+            "active_kv_bytes": {
+                "num": (total_blocks - free_blocks) * block_size * self._bytes_per_token
+            },
             # The engine's own ceiling on work per step. Read, not
             # modelled: `max_num_scheduled_tokens` is exactly the budget
             # the scheduler spends.
