@@ -55,6 +55,16 @@ def _client_of(request_id: str) -> str:
     return head if sep else request_id
 
 
+def _max_tokens_of(request: Any) -> int:
+    """The output ceiling the caller asked for, if the engine kept it."""
+    params = getattr(request, "sampling_params", None)
+    for name in ("max_tokens", "max_new_tokens"):
+        value = getattr(params, name, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return 0
+
+
 def _group_of(request_id: str) -> str:
     """The group a request belongs to, from the caller's own id.
 
@@ -408,6 +418,23 @@ class PlexObserver:
                 # policy that has been switched off one fact at a time.
                 "input_tokens": {"num": prompt},
                 "output_tokens": {"num": generated},
+                # How much output this request asked for.
+                #
+                # `chameleon` weights request size from predicted output
+                # and `qlm` divides slack by it; neither could see it, so
+                # every request was the same size and there was nothing
+                # to separate or to order. The engine knows the number --
+                # it is the caller's own `max_tokens` and the sampler
+                # holds it -- so this is a fact vLLM has and did not
+                # publish rather than one it would have to invent.
+                #
+                # A *requested* maximum, not a prediction of what will
+                # actually be produced. The distinction matters and the
+                # ports treat the number as an upper bound, which is what
+                # it is.
+                "predicted_output_tokens": {
+                    "num": int(_max_tokens_of(request) or 0)
+                },
                 "arrival_ms": {"num": int(request.arrival_time * 1000)},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
