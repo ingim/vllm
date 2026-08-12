@@ -13,6 +13,7 @@ from vllm.distributed.kv_events import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.plex_cache import PlexEviction
+from vllm.v1.core.sched.plex_observer import note_chain as plex_note_chain
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -301,6 +302,12 @@ class BlockPool:
             )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        # Which prefix each of this request's blocks belongs to. Recorded
+        # here because this is the only place the chain is visible in
+        # order; see plex_observer.note_chain.
+        if self.plex_eviction is not None:
+            plex_note_chain(blocks)
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:

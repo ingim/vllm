@@ -115,6 +115,46 @@ def _page_id(block_hash: Any) -> str:
     return f"p{value:08x}"
 
 
+# The prefix a page belongs to, by page id.
+#
+# A page id names a page, and a page is gone the moment the engine takes
+# it: 97.6% of the names a policy pinned were absent from the free queue
+# by the time the engine read them. A *prefix* outlives its pages. When
+# the same prompt is computed again it produces the same chain, so a
+# name taken from the chain's first block still means something after
+# every page under it has been evicted and recreated.
+#
+# Bounded, because it is a cache of names and not a ledger. The oldest
+# entries go first; a prefix nobody has touched in 200,000 pages is not
+# one a policy is still protecting.
+ROOT_OF_PAGE: dict[str, str] = {}
+ROOT_TABLE_LIMIT = 200_000
+
+
+def note_chain(blocks: list) -> None:
+    """Record which prefix each block of a request belongs to.
+
+    Called where vLLM hashes a request's blocks, which is the only place
+    the chain is visible in order. The first block's id is the prefix's
+    name: every request sharing that prefix produces the same first
+    block hash, which is what prefix caching is.
+    """
+    if not blocks:
+        return
+    root = None
+    for block in blocks:
+        block_hash = getattr(block, "block_hash", None)
+        if block_hash is None:
+            continue
+        page = _page_id(block_hash)
+        if root is None:
+            root = page
+        ROOT_OF_PAGE[page] = root
+    if len(ROOT_OF_PAGE) > ROOT_TABLE_LIMIT:
+        for page in list(ROOT_OF_PAGE)[: len(ROOT_OF_PAGE) - ROOT_TABLE_LIMIT]:
+            ROOT_OF_PAGE.pop(page, None)
+
+
 class PlexObserver:
     """One scheduler, in the contract's vocabulary. Holds no policy.
 
@@ -572,6 +612,10 @@ class PlexObserver:
                 # and a cache port that filters on `leaf` should see all
                 # of them rather than none.
                 "leaf": {"flag": True},
+                # The prefix this page belongs to. A policy that wants a
+                # prefix kept can name this instead of the page, and the
+                # name survives the page.
+                "prefix": {"text": ROOT_OF_PAGE.get(page_id, page_id)},
                 "hit-count": {
                     "num": int(self._page_hits.get(page_id, 0))
                 },

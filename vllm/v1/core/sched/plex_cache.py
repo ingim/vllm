@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue
 
-from vllm.v1.core.sched.plex_observer import _page_id
+from vllm.v1.core.sched.plex_observer import ROOT_OF_PAGE, _page_id
 
 
 # How many blocks any single pass may touch.
@@ -78,6 +78,16 @@ VISIT_BUDGET = int(os.environ.get("VLLM_PLEX_EVICT_VISITS", "1024"))
 
 # How many allocations may pass between two applications of the pin.
 PIN_STRIDE = int(os.environ.get("VLLM_PLEX_PIN_STRIDE", "16"))
+
+# The pin's own visit budget.
+#
+# Separate from `VISIT_BUDGET` because the two passes run at different
+# rates. The order is applied on every allocation, so its walk has to be
+# short. The pin is applied every `PIN_STRIDE` allocations, so it can
+# afford a walk `PIN_STRIDE` times longer for the same amortised cost --
+# and it needs one: a pin that only sees the first 1,024 blocks of an
+# 8,192-block pool can protect an eighth of what it names.
+PIN_VISITS = int(os.environ.get("VLLM_PLEX_PIN_VISITS", str(VISIT_BUDGET * 8)))
 
 
 
@@ -424,25 +434,36 @@ class PlexEviction:
         if self._since_pin < PIN_STRIDE:
             return
         self._since_pin = 0
+        # A pin names a page or a prefix, and the difference is the
+        # point. A page name is dead the moment the engine takes the
+        # page -- 97.6% of pinned page names were already absent. A
+        # prefix name is matched against whatever pages belong to that
+        # prefix *now*, including ones computed after the pin was
+        # written, so it survives the eviction it was trying to prevent.
         wanted = set(self._pin)
         found: dict[str, Any] = {}
+        keep: list[Any] = []
         block = queue.fake_free_list_head.next_free_block
         tail = queue.fake_free_list_tail
         visits = 0
-        while block is not None and block is not tail and len(found) < len(wanted):
+        while block is not None and block is not tail:
             identifier = page_id(block)
-            if identifier is not None and identifier in wanted:
-                found[identifier] = block
+            if identifier is not None:
+                if identifier in wanted:
+                    found[identifier] = block
+                    keep.append(block)
+                elif ROOT_OF_PAGE.get(identifier) in wanted:
+                    keep.append(block)
             visits += 1
-            if visits >= VISIT_BUDGET:
+            if visits >= PIN_VISITS:
                 break
             block = block.next_free_block
         # Named but absent. A pinned page missing from the free queue is
         # either in use -- which needs no protection -- or already gone,
         # which is a pin that arrived too late. Without this counter the
         # two are indistinguishable from a pin that did nothing.
-        self.pin_absent += len(wanted) - len(found)
-        movers = [found[page] for page in self._pin if page in found]
+        self.pin_absent += max(len(wanted) - len(found), 0)
+        movers = keep
         if not movers:
             return
         for mover in movers:
