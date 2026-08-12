@@ -80,6 +80,7 @@ VISIT_BUDGET = int(os.environ.get("VLLM_PLEX_EVICT_VISITS", "1024"))
 PIN_STRIDE = int(os.environ.get("VLLM_PLEX_PIN_STRIDE", "16"))
 
 
+
 def page_id(block: Any) -> str | None:
     """The id stage ① published for this block, or None if it has none.
 
@@ -180,6 +181,7 @@ class PlexEviction:
         self.calls = 0
         # Pages moved to the tail because the policy pinned them.
         self.pinned = 0
+        self.pin_absent = 0
         # Allocations where the queue already matched the order. The
         # difference between this and `calls` is how much work the
         # attachment avoided.
@@ -435,6 +437,11 @@ class PlexEviction:
             if visits >= VISIT_BUDGET:
                 break
             block = block.next_free_block
+        # Named but absent. A pinned page missing from the free queue is
+        # either in use -- which needs no protection -- or already gone,
+        # which is a pin that arrived too late. Without this counter the
+        # two are indistinguishable from a pin that did nothing.
+        self.pin_absent += len(wanted) - len(found)
         movers = [found[page] for page in self._pin if page in found]
         if not movers:
             return
@@ -460,7 +467,7 @@ class PlexEviction:
             f"[plex-cache] calls={self.calls} named={self.named} "
             f"applied={self.applied} settled={self.settled} "
             f"order={len(self._order)} installs={self.installs} "
-            f"pinned={self.pinned}",
+            f"pinned={self.pinned} absent={self.pin_absent}",
             file=sys.stderr,
             flush=True,
         )
