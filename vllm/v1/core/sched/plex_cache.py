@@ -58,6 +58,25 @@ if TYPE_CHECKING:
 from vllm.v1.core.sched.plex_observer import _page_id
 
 
+# How many blocks any single pass may touch.
+#
+# Every walk in this module is over the free queue, which is the pool,
+# and the pool is the largest thing in the engine. Measured on a scan
+# corpus with an 8,192-block pool and a 2,048-page order: a request that
+# took 107 ms took **2,378 ms**, and the apparatus arm -- the same
+# policy computing the same order with the engine ignoring it -- took
+# 118. The cost was not the policy and not the bridge. It was three
+# unbounded walks per unsettled call, a thousand calls, eight thousand
+# blocks each.
+#
+# The splice only ever controls the *front* of the cached region, so a
+# pass that gives up after a bounded prefix does strictly less work and
+# establishes a strictly weaker version of the same property. Left
+# unbounded it establishes the stronger property at a price nobody
+# would pay.
+VISIT_BUDGET = int(os.environ.get("VLLM_PLEX_EVICT_VISITS", "1024"))
+
+
 def page_id(block: Any) -> str | None:
     """The id stage ① published for this block, or None if it has none.
 
@@ -84,9 +103,16 @@ def first_cached(queue: FreeKVCacheBlockQueue) -> Any:
     """
     block = queue.fake_free_list_head.next_free_block
     tail = queue.fake_free_list_tail
+    visits = 0
     while block is not None and block is not tail:
         if getattr(block, "block_hash", None) is not None:
             return block
+        visits += 1
+        if visits >= VISIT_BUDGET:
+            # A run of unhashed blocks longer than the budget means the
+            # pool is mostly free, and a pool that is mostly free is not
+            # evicting anything an order could be about.
+            return None
         block = block.next_free_block
     return None
 
@@ -226,7 +252,16 @@ class PlexEviction:
         tail = queue.fake_free_list_tail
         highest = -1
         seen_named = 0
+        visits = 0
         while block is not None and block is not tail:
+            visits += 1
+            if visits > VISIT_BUDGET:
+                # Past the budget, say "not settled" rather than "settled".
+                # The two answers are not symmetric: claiming settled skips
+                # the splice, so a wrong "yes" leaves the order unenacted
+                # and looks like a policy that decided nothing. A wrong
+                # "no" costs one bounded splice.
+                return False
             identifier = page_id(block)
             rank = self._rank.get(identifier) if identifier else None
             if rank is None:
@@ -257,9 +292,16 @@ class PlexEviction:
         to be passed by -- a new block freed into the middle, or a
         reordering the engine did for its own reasons.
         """
+        visits = 0
         while block is not None:
             identifier = page_id(block)
             if identifier is not None and identifier in self._rank:
+                return True
+            visits += 1
+            if visits >= VISIT_BUDGET:
+                # Same asymmetry as `_settled`: the caller reads True as
+                # "not settled", so stopping early costs a splice and
+                # never skips one.
                 return True
             block = block.next_free_block
         return False
@@ -292,10 +334,18 @@ class PlexEviction:
         found: dict[str, Any] = {}
         block = queue.fake_free_list_head.next_free_block
         tail = queue.fake_free_list_tail
+        visits = 0
         while block is not None and block is not tail and len(found) < len(wanted):
             identifier = page_id(block)
             if identifier is not None and identifier in wanted:
                 found[identifier] = block
+            visits += 1
+            if visits >= VISIT_BUDGET:
+                # Splice what was found in the prefix visited. The order
+                # is a standing document reapplied on every call, so a
+                # pass that enacts part of it is not a partial order --
+                # it is the same order, converging.
+                break
             block = block.next_free_block
 
         victims = [found[page] for page in self._order if page in found]
