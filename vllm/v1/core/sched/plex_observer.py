@@ -65,6 +65,20 @@ def _max_tokens_of(request: Any) -> int:
     return 0
 
 
+def _field_of(request_id: str, index: int) -> str:
+    """The nth `::`-separated field of a request id, or the last there is.
+
+    Degrading to a coarser level rather than to nothing matters: a
+    workload that names a user and no application should look like one
+    application per user, not like an absent fact that a policy silently
+    defaults.
+    """
+    parts = request_id.split("::")
+    if not parts:
+        return request_id
+    return parts[min(index, len(parts) - 1)]
+
+
 def _group_of(request_id: str) -> str:
     """The group a request belongs to, from the caller's own id.
 
@@ -410,6 +424,24 @@ class PlexObserver:
                 # improve on. Measured that way, decision alone 1.000x
                 # and 1.007x.
                 "group": {"text": _group_of(request.request_id)},
+                # The caller's own identifiers, from the same id.
+                #
+                # `fairserve` reads `user-id`, `application-id` and
+                # `stage-id` and limits each against an rpm budget. None
+                # of the three is anything vLLM knows -- a user is a
+                # deployment's concept, an application is its caller's,
+                # and a stage is a step within one. All three arrive with
+                # the request or not at all, and without them the policy
+                # sees one user running one application at one stage,
+                # which is the case it has nothing to say about.
+                #
+                # `<user>::<application>::<stage>::<unique>`, with each
+                # falling back to what precedes it so a workload that
+                # names fewer levels degrades to coarser accounting
+                # rather than to none.
+                "user_id": {"text": _field_of(request.request_id, 0)},
+                "application_id": {"text": _field_of(request.request_id, 1)},
+                "stage_id": {"text": _field_of(request.request_id, 2)},
                 # Spellings the ports use for quantities already
                 # published under another name. A port that reads
                 # `input-tokens` and is handed `prompt_tokens` sees
