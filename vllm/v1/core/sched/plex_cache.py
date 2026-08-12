@@ -124,6 +124,15 @@ class PlexEviction:
         self._source_stamp: tuple[int, int] | None = None
         self._order: list[str] = []
         self._rank: dict[str, int] = {}
+        # How many named pages the last splice actually found. The
+        # settled check compares against what was placeable, not against
+        # the order's length: an order naming five hundred pages of
+        # which twelve are free is satisfied by those twelve.
+        # `None` until a splice has run, so "nothing placed yet" is not
+        # confused with "nothing was placeable". The first call after an
+        # install must always do the work: with a zero here it settled
+        # immediately and `applied` stayed at zero forever.
+        self._placeable: int | None = None
         self.installs = 0
         # Pages named by the policy that were found in the free queue and
         # moved, against pages named at all. Reported rather than
@@ -177,6 +186,8 @@ class PlexEviction:
                 continue
             order = document.get("evict")
             if isinstance(order, list):
+                # A new order invalidates the last splice's accounting.
+                self._placeable = None
                 self._order = [str(page) for page in order]
                 # Position of each page, so `_settled` can start from
                 # wherever the queue's cached region begins rather than
@@ -186,36 +197,72 @@ class PlexEviction:
             return
 
     def _settled(self, queue: FreeKVCacheBlockQueue) -> bool:
-        """Is the cached region already the order, or a suffix of it?
+        """Are the named pages at the front, in order, allowing removals?
 
-        A suffix, and that is the whole point. After one successful
-        splice the cached region begins with `order[0]`; the engine then
-        takes blocks off the head, so by the next allocation it begins
-        with `order[k]` for some k. Demanding a match from `order[0]`
-        fails on every call after the first, which is why the fast path
-        fired 8 to 36 times in two hundred allocations and the O(pool)
-        splice ran for the rest.
+        Three versions, and the middle one is the lesson.
 
-        Matching from wherever the region actually starts costs one
-        dictionary lookup and then a walk as long as what remains.
+        **Exact match from `order[0]`** failed on every call after the
+        first, because the engine takes blocks off the head: the fast
+        path fired 8 to 36 times in 200 allocations.
+
+        **Non-decreasing rank anywhere in the region** settled
+        everything: `settled=1000, applied=0`, because a cached region
+        with no named page in it trivially satisfies it. A relaxation
+        that a *completely unordered* queue also satisfies is not a
+        weaker check, it is no check.
+
+        What the splice actually establishes is that the named pages sit
+        **at the front of the cached region, in the order's order**, and
+        that survives removals -- a page taken by the engine or pulled
+        out by a cache hit does not make the rest wrong. So: walk from
+        the first cached block while the pages are named, require their
+        ranks to increase, and require the run to end only when the
+        order is exhausted or an unnamed page appears. An unnamed page
+        *before* a named one is the violation the splice exists to fix.
         """
-        block = first_cached(queue)
-        if block is None:
-            return True
-        identifier = page_id(block)
-        start = self._rank.get(identifier) if identifier else None
-        if start is None:
+        if self._placeable is None:
             return False
+        block = first_cached(queue)
         tail = queue.fake_free_list_tail
-        for page in self._order[start:]:
-            if block is None or block is tail:
-                # The order outruns the queue: everything still present
-                # is in the right place and the rest has been taken.
-                return True
-            if page_id(block) != page:
+        highest = -1
+        seen_named = 0
+        while block is not None and block is not tail:
+            identifier = page_id(block)
+            rank = self._rank.get(identifier) if identifier else None
+            if rank is None:
+                # An unnamed page here means everything after it is
+                # behind something the order did not ask to be behind.
+                # Settled only if the splice's own placements are all
+                # accounted for.
+                # Every named page still *present* is accounted for.
+                #
+                # Comparing against the splice's own count fails the
+                # moment a cache hit takes one of them out: the run is
+                # shorter and nothing is wrong. What has to hold is that
+                # no named page sits behind an unnamed one, which is
+                # checked by looking for any further along.
+                return not self._named_beyond(block)
+            if rank < highest:
                 return False
+            highest = rank
+            seen_named += 1
             block = block.next_free_block
         return True
+
+    def _named_beyond(self, block: Any) -> bool:
+        """Is any page the order names still further down the queue?
+
+        The splice put them all at the front, so one found after an
+        unnamed page has been passed by something the order did not ask
+        to be passed by -- a new block freed into the middle, or a
+        reordering the engine did for its own reasons.
+        """
+        while block is not None:
+            identifier = page_id(block)
+            if identifier is not None and identifier in self._rank:
+                return True
+            block = block.next_free_block
+        return False
 
     def prefer(self, queue: FreeKVCacheBlockQueue) -> int:
         """Move the policy's victims to the head of the free queue.
@@ -230,6 +277,12 @@ class PlexEviction:
         self.calls += 1
         if self._settled(queue):
             self.settled += 1
+            # Reported here too. The counters used to print only on the
+            # slow path, so once the fast path started firing the log
+            # went silent -- and a silent counter is the same evidence
+            # as an absent one, which is the confusion §50 cost a round
+            # to.
+            self._report()
             return 0
 
         # Walk the queue once, building only the mapping the order needs.
@@ -282,6 +335,7 @@ class PlexEviction:
             splice_before(queue, anchor, victims)
 
         self.applied += len(victims)
+        self._placeable = len(victims)
         self._report()
         return len(victims)
 
