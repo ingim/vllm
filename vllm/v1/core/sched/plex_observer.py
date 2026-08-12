@@ -139,6 +139,18 @@ class PlexObserver:
         # that keeps coming back to the offer without being taken is one
         # the engine keeps deciding not to evict.
         self._page_hits: dict[str, int] = {}
+        # Read once. These are deployment settings and do not change
+        # under a run; re-reading the environment every step would be
+        # cost for nothing.
+        self._rate_limits: dict[str, dict[str, Any]] = {}
+        for name, key in (
+            ("VLLM_PLEX_USER_RPM", "user-rpm-limit"),
+            ("VLLM_PLEX_APP_RPM", "app-rpm-limit"),
+            ("VLLM_PLEX_RPM_WINDOW_MS", "rpm-window-ms"),
+        ):
+            raw = os.environ.get(name)
+            if raw and raw.isdigit():
+                self._rate_limits[key.replace("-", "_")] = {"num": int(raw)}
         self._arrivals = 0
         # Edges since the last document. Cleared on emit, because an event
         # delivered twice is one thing a policy counts as two.
@@ -442,6 +454,31 @@ class PlexObserver:
                 "user_id": {"text": _field_of(request.request_id, 0)},
                 "application_id": {"text": _field_of(request.request_id, 1)},
                 "stage_id": {"text": _field_of(request.request_id, 2)},
+                # The deployment's own rate limits, from the environment.
+                #
+                # `fairserve`'s throttle only reorders when someone is
+                # over their limit, and with no limit published every
+                # user sits under an infinite budget and it never fires
+                # -- measured, 296,330 requests ranked and **zero**
+                # moved. A rate limit with no rate is not a rate limit,
+                # and a policy given one correctly declines to reorder.
+                #
+                # An operator's setting, so it comes from the operator:
+                # `VLLM_PLEX_USER_RPM`, `VLLM_PLEX_APP_RPM` and
+                # `VLLM_PLEX_RPM_WINDOW_MS`. Unset, nothing is published
+                # and the policy behaves as it did.
+                **self._rate_limits,
+                # Whether the pool is under pressure, on the request as
+                # well as on the target.
+                #
+                # `fairserve` reads `kv-overloaded` from the *request*
+                # and it was published only on the target, so the flag
+                # guarding its entire throttle was never true. It is a
+                # property of the engine either way -- a request served
+                # by an overloaded engine is an overloaded request -- and
+                # publishing it in one place only made the fact
+                # unreachable from where a policy looks.
+                "kv_overloaded": {"flag": self._kv_overloaded()},
                 # Spellings the ports use for quantities already
                 # published under another name. A port that reads
                 # `input-tokens` and is handed `prompt_tokens` sees
@@ -549,6 +586,22 @@ class PlexObserver:
         return facts
 
 
+    def _kv_overloaded(self) -> bool:
+        """Is the block pool under pressure?
+
+        One definition, read from two places. It was inline in the
+        target facts and `fairserve` reads it on the request, so a
+        second copy would have been two thresholds that agreed until
+        someone changed one.
+        """
+        try:
+            pool = self._scheduler.kv_cache_manager.block_pool
+            free_blocks = pool.get_num_free_blocks()
+            total_blocks = pool.num_gpu_blocks
+        except AttributeError:
+            return False
+        return bool(total_blocks) and free_blocks < total_blocks / 10
+
     def _step_timing(self) -> tuple[int, int]:
         """Median step wall clock, and the decode cost it implies.
 
@@ -623,7 +676,7 @@ class PlexObserver:
                 if running
                 else 0
             },
-            "kv_overloaded": {"flag": free_blocks < total_blocks / 10},
+            "kv_overloaded": {"flag": self._kv_overloaded()},
             "step_ms": {"num": step_ms},
             # Time per output token, from the observer's own timing. The
             # engine keeps no such number, so this is measured rather
