@@ -55,6 +55,21 @@ def _client_of(request_id: str) -> str:
     return head if sep else request_id
 
 
+def _group_of(request_id: str) -> str:
+    """The group a request belongs to, from the caller's own id.
+
+    `<client>::<group>::<rest>`. Falls back to the client when there is
+    no second separator, so a workload that names no groups puts each
+    tenant in one group rather than each request in its own -- the
+    latter is what "no groups" used to mean and it is the degenerate
+    case both group-aware policies are written against.
+    """
+    parts = request_id.split("::")
+    if len(parts) >= 3:
+        return f"{parts[0]}::{parts[1]}"
+    return parts[0]
+
+
 def _page_id(block_hash: Any) -> str:
     """A page's name, stable across processes.
 
@@ -372,6 +387,27 @@ class PlexObserver:
                 # 7.000, because the policy had nothing to be fair
                 # between.
                 "client_id": {"text": _client_of(request.request_id)},
+                # The group a request belongs to, from the caller's id.
+                #
+                # `justitia` prices memory-time "over the whole agent,
+                # not one request" and `qlm` orders "request groups";
+                # both read `group`, and vLLM has no such concept. The
+                # caller names it, the same way it names the tenant:
+                # everything between the first `::` and the second.
+                #
+                # Without it both policies see every request as its own
+                # group of one, which is the shape their papers exist to
+                # improve on. Measured that way, decision alone 1.000x
+                # and 1.007x.
+                "group": {"text": _group_of(request.request_id)},
+                # Spellings the ports use for quantities already
+                # published under another name. A port that reads
+                # `input-tokens` and is handed `prompt_tokens` sees
+                # `unknown-key`, defaults, and decides on a constant --
+                # which is not a disagreement about vocabulary, it is a
+                # policy that has been switched off one fact at a time.
+                "input_tokens": {"num": prompt},
+                "output_tokens": {"num": generated},
                 "arrival_ms": {"num": int(request.arrival_time * 1000)},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
