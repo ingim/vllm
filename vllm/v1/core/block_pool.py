@@ -307,7 +307,7 @@ class BlockPool:
         # here because this is the only place the chain is visible in
         # order; see plex_observer.note_chain.
         if self.plex_eviction is not None:
-            plex_note_chain(blocks)
+            plex_note_chain(blocks, getattr(request, "request_id", None))
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:

@@ -130,8 +130,18 @@ def _page_id(block_hash: Any) -> str:
 ROOT_OF_PAGE: dict[str, str] = {}
 ROOT_TABLE_LIMIT = 200_000
 
+# The request a page was computed for, by page id.
+#
+# `beneficiaries` is the fact a cache policy uses to get from a page to
+# whoever wants it, and nothing published it: `continuum` reads it to
+# find which program a page belongs to, found nothing, fell back to
+# "default", and pinned zero pages on a workload made of exactly the
+# sessions it exists to hold. A policy whose mechanism has nothing to
+# attach to is indistinguishable at runtime from one that does not work.
+BENEFICIARY_OF_PAGE: dict[str, str] = {}
 
-def note_chain(blocks: list) -> None:
+
+def note_chain(blocks: list, request_id: str | None = None) -> None:
     """Record which prefix each block of a request belongs to.
 
     Called where vLLM hashes a request's blocks, which is the only place
@@ -150,9 +160,12 @@ def note_chain(blocks: list) -> None:
         if root is None:
             root = page
         ROOT_OF_PAGE[page] = root
+        if request_id is not None:
+            BENEFICIARY_OF_PAGE[page] = request_id
     if len(ROOT_OF_PAGE) > ROOT_TABLE_LIMIT:
         for page in list(ROOT_OF_PAGE)[: len(ROOT_OF_PAGE) - ROOT_TABLE_LIMIT]:
             ROOT_OF_PAGE.pop(page, None)
+            BENEFICIARY_OF_PAGE.pop(page, None)
 
 
 class PlexObserver:
@@ -616,6 +629,14 @@ class PlexObserver:
                 # prefix kept can name this instead of the page, and the
                 # name survives the page.
                 "prefix": {"text": ROOT_OF_PAGE.get(page_id, page_id)},
+                # Who this page was computed for. One id: vLLM's pool is
+                # flat and a block belongs to the request that hashed it,
+                # whatever later requests hit it.
+                "beneficiaries": {
+                    "ids": [BENEFICIARY_OF_PAGE[page_id]]
+                    if page_id in BENEFICIARY_OF_PAGE
+                    else []
+                },
                 "hit-count": {
                     "num": int(self._page_hits.get(page_id, 0))
                 },
