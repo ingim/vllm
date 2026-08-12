@@ -76,6 +76,9 @@ from vllm.v1.core.sched.plex_observer import _page_id
 # would pay.
 VISIT_BUDGET = int(os.environ.get("VLLM_PLEX_EVICT_VISITS", "1024"))
 
+# How many allocations may pass between two applications of the pin.
+PIN_STRIDE = int(os.environ.get("VLLM_PLEX_PIN_STRIDE", "16"))
+
 
 def page_id(block: Any) -> str | None:
     """The id stage ① published for this block, or None if it has none.
@@ -149,6 +152,13 @@ class PlexEviction:
         self._source = source if source else os.environ.get("VLLM_PLEX_EVICT")
         self._source_stamp: tuple[int, int] | None = None
         self._order: list[str] = []
+        # Pages the policy asked to evict *last*. A separate list because
+        # an eviction order cannot say it: protecting a small set with
+        # "evict these first" means naming the complement, and the tail
+        # of an order is not a pin -- `hotprefix` puts pages already off
+        # the GPU there.
+        self._pin: list[str] = []
+        self._since_pin = 0
         self._rank: dict[str, int] = {}
         # How many named pages the last splice actually found. The
         # settled check compares against what was placeable, not against
@@ -168,6 +178,8 @@ class PlexEviction:
         self.named = 0
         self.applied = 0
         self.calls = 0
+        # Pages moved to the tail because the policy pinned them.
+        self.pinned = 0
         # Allocations where the queue already matched the order. The
         # difference between this and `calls` is how much work the
         # attachment avoided.
@@ -210,6 +222,9 @@ class PlexEviction:
                 document = json.loads(line)
             except ValueError:
                 continue
+            pinned = document.get("pin")
+            if isinstance(pinned, list):
+                self._pin = [str(page) for page in pinned]
             order = document.get("evict")
             if isinstance(order, list):
                 # A new order invalidates the last splice's accounting.
@@ -313,7 +328,7 @@ class PlexEviction:
         reads, so nothing can happen between the reorder and the take —
         a read may happen mid-pass, a write may not, and this is a write.
         """
-        if not self._order:
+        if not self._order and not self._pin:
             return 0
 
         self.calls += 1
@@ -350,6 +365,7 @@ class PlexEviction:
 
         victims = [found[page] for page in self._order if page in found]
         self.named += len(self._order)
+        self._apply_pin(queue)
         if not victims:
             self._report()
             return 0
@@ -389,6 +405,44 @@ class PlexEviction:
         self._report()
         return len(victims)
 
+    def _apply_pin(self, queue: FreeKVCacheBlockQueue) -> None:
+        """Move pinned pages to the tail, where the engine looks last.
+
+        One bounded pass. The cost is O(the set to protect), which is the
+        point: the same protection expressed as an eviction order costs
+        O(everything else).
+        """
+        if not self._pin:
+            return
+        # A pin is a standing statement, not a per-allocation one. Applied
+        # on every call it cost 144 ms a request against 1,454: the walk
+        # is bounded but it still runs, and the tail it establishes only
+        # decays as fast as the engine consumes the queue ahead of it.
+        self._since_pin += 1
+        if self._since_pin < PIN_STRIDE:
+            return
+        self._since_pin = 0
+        wanted = set(self._pin)
+        found: dict[str, Any] = {}
+        block = queue.fake_free_list_head.next_free_block
+        tail = queue.fake_free_list_tail
+        visits = 0
+        while block is not None and block is not tail and len(found) < len(wanted):
+            identifier = page_id(block)
+            if identifier is not None and identifier in wanted:
+                found[identifier] = block
+            visits += 1
+            if visits >= VISIT_BUDGET:
+                break
+            block = block.next_free_block
+        movers = [found[page] for page in self._pin if page in found]
+        if not movers:
+            return
+        for mover in movers:
+            queue.remove(mover)
+        queue.append_n(movers)
+        self.pinned += len(movers)
+
     def _report(self) -> None:
         """Say what the order actually reached, periodically.
 
@@ -405,7 +459,8 @@ class PlexEviction:
         print(
             f"[plex-cache] calls={self.calls} named={self.named} "
             f"applied={self.applied} settled={self.settled} "
-            f"order={len(self._order)} installs={self.installs}",
+            f"order={len(self._order)} installs={self.installs} "
+            f"pinned={self.pinned}",
             file=sys.stderr,
             flush=True,
         )
