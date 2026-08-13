@@ -186,6 +186,28 @@ BENEFICIARIES_OF_PAGE: dict[str, set[str]] = {}
 # far as any ranking is concerned.
 BENEFICIARY_LIMIT = 64
 
+# The scheduling step most recently observed, and the step at which each
+# page was last actually demanded. Module-level because `note_demand` is
+# a hook on the cache manager and has no observer to ask.
+CURRENT_STEP = 0
+LAST_DEMAND_STEP: dict[str, int] = {}
+
+# Which reading of `steps-to-execution` to publish.
+#
+#   live      -- the distance to a live reader, or nothing (see §107).
+#   recorded  -- when no live reader exists, substitute the number of
+#                steps since the page was last demanded.
+#
+# `live` is the default because it is the honest one. `recorded` exists
+# to be *measured*, not to be believed: it is the same substitution made
+# for `beneficiaries` (live demand for an eviction candidate is empty by
+# construction, so recorded demand stands in), applied to a quantity
+# where the substitution is not obviously legitimate. A count of past
+# demand is a real count. A distance into the past is not a distance
+# into the future, and a policy that ranks the same either way was
+# ranking on recency all along.
+LOOKAHEAD_READING = os.environ.get("PLEX_LOOKAHEAD", "live")
+
 
 def note_chain(blocks: list, request_id: str | None = None) -> None:
     """Record which prefix each block of a request belongs to.
@@ -214,6 +236,7 @@ def note_chain(blocks: list, request_id: str | None = None) -> None:
         for page in list(ROOT_OF_PAGE)[: len(ROOT_OF_PAGE) - ROOT_TABLE_LIMIT]:
             ROOT_OF_PAGE.pop(page, None)
             BENEFICIARIES_OF_PAGE.pop(page, None)
+            LAST_DEMAND_STEP.pop(page, None)
 
 
 def note_demand(groups: list, request_id: str) -> None:
@@ -235,7 +258,9 @@ def note_demand(groups: list, request_id: str) -> None:
             block_hash = getattr(block, "block_hash", None)
             if block_hash is None:
                 continue
-            wanted = BENEFICIARIES_OF_PAGE.setdefault(_page_id(block_hash), set())
+            page = _page_id(block_hash)
+            LAST_DEMAND_STEP[page] = CURRENT_STEP
+            wanted = BENEFICIARIES_OF_PAGE.setdefault(page, set())
             if len(wanted) < BENEFICIARY_LIMIT:
                 wanted.add(request_id)
 
@@ -406,6 +431,8 @@ class PlexObserver:
         if gate_tick is not None:
             gate_tick()
         self._step += 1
+        global CURRENT_STEP
+        CURRENT_STEP = self._step
         document_now_ms = int(time.time() * 1000)
         if self._last_step_ms is not None:
             self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
@@ -454,6 +481,13 @@ class PlexObserver:
                     page = _page_id(block_hash)
                     if distance.get(page, position + 1) > position:
                         distance[page] = position
+        if LOOKAHEAD_READING != "recorded":
+            return distance
+        # The substitution under test. Steps since the page was last
+        # demanded, for pages no live request will read -- which, on a
+        # free queue, is nearly all of them.
+        for page, step in LAST_DEMAND_STEP.items():
+            distance.setdefault(page, max(CURRENT_STEP - step, 0))
         return distance
 
     def _tracked(self) -> list[Request]:
