@@ -73,6 +73,31 @@ def _program_of(request_id: str) -> str:
     return head
 
 
+def _program_plan(request_id: str) -> dict[str, Any]:
+    """The tool structure the caller encoded in its request id.
+
+    `program::step::tool::next-tool::finished`, written by
+    `cache-regime.request_name`. These are properties of the program,
+    not of the engine: vLLM has no tool concept and cannot invent one,
+    so a policy written about tool structure either reads the caller's
+    declaration or reads nothing. Measured: `continuum` sat exactly on
+    the baseline at every model size and on three corpora.
+
+    A `-` marks a field the corpus lacked, and produces no fact at all
+    rather than a fact naming a tool called "-".
+    """
+    parts = request_id.split("::")
+    if len(parts) < 5:
+        return {}
+    tool, following, finished = parts[2], parts[3], parts[4]
+    plan: dict[str, Any] = {"program-finished": {"flag": finished == "1"}}
+    if tool and tool != "-":
+        plan["tool-id"] = {"text": tool}
+    if following and following != "-":
+        plan["next-tool-id"] = {"text": following}
+    return plan
+
+
 def _max_tokens_of(request: Any) -> int:
     """The output ceiling the caller asked for, if the engine kept it."""
     params = getattr(request, "sampling_params", None)
@@ -329,6 +354,14 @@ class PlexObserver:
         # tables below: a program nobody has sent for is not one a policy
         # is still holding.
         self._program_arrival: dict[str, int] = {}
+        # When each program's previous request finished, and how long it
+        # was away before the next one arrived. From the engine's side
+        # that gap *is* the tool duration: the program left, something
+        # happened elsewhere, it came back. It is observed rather than
+        # declared, which is why it is computed here and not carried in
+        # the request id like the rest of the plan.
+        self._program_last_finish: dict[str, int] = {}
+        self._program_gap: dict[str, int] = {}
         self._finished: list[list[str]] = []
         # The pause edge. vLLM does not announce a preemption; it
         # increments a counter on the request and puts it back on the
@@ -338,6 +371,16 @@ class PlexObserver:
         # fire against this engine, which is not the same as the engine
         # never preempting.
         self._paused: list[list[str]] = []
+        # Requests that left this step, kept as subjects for exactly the
+        # one document that announces their finish. The contract offers
+        # `on-finished` with fact access, and a port that drops a
+        # request from `subjects` in the same document it reports the
+        # request finishing makes those facts unreadable at the only
+        # moment they are wanted. Measured: 248 of 248 finished events
+        # named a request carrying no facts, so `continuum` -- whose
+        # whole mechanism runs off `on_finished` -- installed `pinned=0`
+        # pins while being handed every fact it asked for.
+        self._finishing: list[Request] = []
         self._preemptions: dict[str, int] = {}
 
     # ── the hooks, and there are two ─────────────────────────────────────
@@ -363,6 +406,12 @@ class PlexObserver:
         made none.
         """
         self._arrival_seq.pop(request.request_id, None)
+        self._finishing.append(request)
+        finished_program = _program_of(request.request_id)
+        self._program_last_finish[finished_program] = int(time.time() * 1000)
+        # Cleared so the program's *next* step measures its own gap
+        # rather than reporting the first one forever.
+        self._program_gap.pop(finished_program, None)
         self._finished.append([request.request_id, "completed", "host"])
 
     def emit_step(self) -> None:
@@ -484,6 +533,7 @@ class PlexObserver:
         self._admitted.clear()
         self._finished.clear()
         self._paused.clear()
+        self._finishing.clear()
         return json.dumps(document)
 
     # ── scraping ─────────────────────────────────────────────────────────
@@ -528,10 +578,22 @@ class PlexObserver:
     def _tracked(self) -> list[Request]:
         scheduler = self._scheduler
         held = getattr(scheduler.waiting, "held_requests", None)
-        return [
+        live = [
             *(held() if held is not None else []),
             *scheduler.waiting,
             *scheduler.running,
+        ]
+        if not self._finishing:
+            return live
+        # Requests leaving this step are still subjects of this step, so
+        # `on-finished` can read their facts. They are gone from the
+        # engine's own queues, so they are appended rather than merged,
+        # and they are dropped again when the step's buffers clear.
+        seen = {request.request_id for request in live}
+        return live + [
+            request
+            for request in self._finishing
+            if request.request_id not in seen
         ]
 
     def _held_ids(self) -> set[str]:
@@ -661,11 +723,17 @@ class PlexObserver:
     def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {request.request_id for request in self._scheduler.running}
         held_ids = self._held_ids()
+        finishing_ids = {
+            request.request_id for request in self._finishing
+        }
         facts: dict[str, dict[str, Any]] = {}
         for request in self._tracked():
-            self._program_arrival.setdefault(
-                _program_of(request.request_id), now_ms
-            )
+            program = _program_of(request.request_id)
+            self._program_arrival.setdefault(program, now_ms)
+            if program not in self._program_gap:
+                previous = self._program_last_finish.get(program)
+                if previous is not None:
+                    self._program_gap[program] = max(now_ms - previous, 0)
         for request in self._tracked():
             running = request.request_id in running_ids
             prompt = request.num_prompt_tokens
@@ -678,7 +746,9 @@ class PlexObserver:
                 # accepted that one, and a policy answering `reject`
                 # would be ruling on something already admitted.
                 "state": {
-                    "text": "pending"
+                    "text": "completed"
+                    if request.request_id in finishing_ids
+                    else "pending"
                     if request.request_id in held_ids
                     else ("active" if running else "admitted")
                 },
@@ -710,6 +780,21 @@ class PlexObserver:
                         _program_of(request.request_id), now_ms
                     )
                 },
+                # The tool structure the caller declared, if it declared
+                # any. Absent for every corpus that has none, so this
+                # adds no fact where there is nothing to say.
+                **_program_plan(request.request_id),
+                **(
+                    {
+                        "tool-duration-ms": {
+                            "num": self._program_gap[
+                                _program_of(request.request_id)
+                            ]
+                        }
+                    }
+                    if _program_of(request.request_id) in self._program_gap
+                    else {}
+                ),
                 # The group a request belongs to, from the caller's id.
                 #
                 # `justitia` prices memory-time "over the whole agent,
