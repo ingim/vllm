@@ -148,6 +148,13 @@ def _page_id(block_hash: Any) -> str:
 ROOT_OF_PAGE: dict[str, str] = {}
 ROOT_TABLE_LIMIT = 200_000
 
+# How far into a single request's prefix the lookahead reads. A request
+# reads its blocks in order, so the pages beyond this bound are the ones
+# furthest from being needed -- the cheapest possible thing to leave
+# unanswered, and it keeps the scan proportional to the queue rather
+# than to the longest prompt in it.
+LOOKAHEAD_PAGE_LIMIT = 512
+
 # The request a page was computed for, by page id.
 #
 # `beneficiaries` is the fact a cache policy uses to get from a page to
@@ -371,6 +378,36 @@ class PlexObserver:
         return json.dumps(document)
 
     # ── scraping ─────────────────────────────────────────────────────────
+
+    def _steps_to_execution(self) -> dict[str, int]:
+        """For each page, how many scheduling turns until it is next read.
+
+        The engine cannot see the future, but it can see its own queue,
+        and that is a real answer rather than a guess: a request that is
+        running reads its prefix now, and a request `k` places back in
+        the waiting queue reads its prefix in `k` turns. Pages are named
+        by the prefix hashes the requests already carry, so this asks the
+        engine only for what it has already computed.
+
+        A page that no live request will read is left out. That absence
+        is the honest reading of "infinitely far", which is exactly the
+        fallback a lookahead policy already applies to a page it cannot
+        place -- inventing a distance for it would be a lie that ranks.
+        """
+        distance: dict[str, int] = {}
+        queues = (
+            (0, self._scheduler.running),
+            (1, self._scheduler.waiting),
+        )
+        for base, queue in queues:
+            for offset, request in enumerate(queue):
+                position = base * (offset + 1)
+                hashes = getattr(request, "block_hashes", None) or ()
+                for block_hash in hashes[:LOOKAHEAD_PAGE_LIMIT]:
+                    page = _page_id(block_hash)
+                    if distance.get(page, position + 1) > position:
+                        distance[page] = position
+        return distance
 
     def _tracked(self) -> list[Request]:
         scheduler = self._scheduler
@@ -642,6 +679,7 @@ class PlexObserver:
         # them keeps the ledger the size of the offer rather than of
         # every page the run ever saw.
         offered = self._offered_pages()
+        step_distance = self._steps_to_execution()
         live = {page_id for page_id, _ in offered}
         if len(self._page_hits) > 4 * max(len(live), 1):
             self._page_hits = {
@@ -663,6 +701,7 @@ class PlexObserver:
         # frequency disagree.
         for rank, (page_id, block) in enumerate(offered):
             page_tokens = int(getattr(block, "_block_hash_num_tokens", 0) or 0)
+            beneficiary_steps = step_distance.get(page_id)
             facts[page_id] = {
                 # Resident, because an eviction candidate is by
                 # definition still in the pool — it is on the free list,
@@ -730,6 +769,21 @@ class PlexObserver:
                         }
                     }
                     if page_id in BENEFICIARY_OF_PAGE
+                    else {}
+                ),
+                # When this page is next needed, as far as a queue can
+                # say. Published only when the beneficiary is still live:
+                # a lookahead policy told a distance for a request that
+                # has finished is being lied to, and the absence already
+                # means "infinitely far".
+                **(
+                    {"steps-to-execution": {"num": beneficiary_steps}}
+                    if beneficiary_steps is not None
+                    else {}
+                ),
+                **(
+                    {"beneficiary-steps": {"nums": [beneficiary_steps]}}
+                    if beneficiary_steps is not None
                     else {}
                 ),
             }
