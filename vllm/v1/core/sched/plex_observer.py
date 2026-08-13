@@ -155,7 +155,7 @@ ROOT_TABLE_LIMIT = 200_000
 # than to the longest prompt in it.
 LOOKAHEAD_PAGE_LIMIT = 512
 
-# The request a page was computed for, by page id.
+# The requests a page would serve, by page id.
 #
 # `beneficiaries` is the fact a cache policy uses to get from a page to
 # whoever wants it, and nothing published it: `continuum` reads it to
@@ -163,7 +163,28 @@ LOOKAHEAD_PAGE_LIMIT = 512
 # "default", and pinned zero pages on a workload made of exactly the
 # sessions it exists to hold. A policy whose mechanism has nothing to
 # attach to is indistinguishable at runtime from one that does not work.
-BENEFICIARY_OF_PAGE: dict[str, str] = {}
+#
+# A *set*, and this is the whole point. It held one id -- the request
+# that hashed the page -- on the argument that vLLM's pool is flat and a
+# block belongs to whoever computed it. That is true of authorship and
+# false of demand, and `peek` is judged on demand: its kernel is
+# `beneficiaries x prefix depth`, so a beneficiary count that is 1 by
+# construction reduces it to "evict the largest page". Measured on 40
+# ShareGPT sessions at 30 rps: 12,897 offered pages, every one of them
+# with exactly one beneficiary, and a policy that reordered 84% of the
+# offer and moved pages a mean of 181 ranks changed the hit rate by
+# 0.0000. It was ranking by a constant.
+#
+# `note_chain` already sees every request that hashes the chain,
+# including the later ones that hit an existing prefix -- it was
+# overwriting rather than accumulating, so the demand was computed and
+# then discarded.
+BENEFICIARIES_OF_PAGE: dict[str, set[str]] = {}
+
+# Per page, because the fact is a decision input and not a ledger. A
+# page wanted by more requests than this is already maximally wanted as
+# far as any ranking is concerned.
+BENEFICIARY_LIMIT = 64
 
 
 def note_chain(blocks: list, request_id: str | None = None) -> None:
@@ -186,11 +207,37 @@ def note_chain(blocks: list, request_id: str | None = None) -> None:
             root = page
         ROOT_OF_PAGE[page] = root
         if request_id is not None:
-            BENEFICIARY_OF_PAGE[page] = request_id
+            wanted = BENEFICIARIES_OF_PAGE.setdefault(page, set())
+            if len(wanted) < BENEFICIARY_LIMIT:
+                wanted.add(request_id)
     if len(ROOT_OF_PAGE) > ROOT_TABLE_LIMIT:
         for page in list(ROOT_OF_PAGE)[: len(ROOT_OF_PAGE) - ROOT_TABLE_LIMIT]:
             ROOT_OF_PAGE.pop(page, None)
-            BENEFICIARY_OF_PAGE.pop(page, None)
+            BENEFICIARIES_OF_PAGE.pop(page, None)
+
+
+def note_demand(groups: list, request_id: str) -> None:
+    """Record that a request reached these already-cached pages.
+
+    `note_chain` records authorship -- who computed a page. This records
+    demand -- who wants it now. They are different populations and only
+    the second one is what a policy ranking pending demand is asking
+    for.
+
+    `groups` is what `find_longest_cache_hit` returns: one list of blocks
+    per KV cache group, already narrowed to the blocks the request will
+    reuse.
+    """
+    if not request_id:
+        return
+    for blocks in groups:
+        for block in blocks:
+            block_hash = getattr(block, "block_hash", None)
+            if block_hash is None:
+                continue
+            wanted = BENEFICIARIES_OF_PAGE.setdefault(_page_id(block_hash), set())
+            if len(wanted) < BENEFICIARY_LIMIT:
+                wanted.add(request_id)
 
 
 class PlexObserver:
@@ -433,6 +480,29 @@ class PlexObserver:
         if pages:
             subjects["page"] = [page_id for page_id, _ in pages]
         return subjects
+
+    def _wanted_by(self, page_id: str, live_ids: set[str]) -> list[str]:
+        """The requests that have reached this page.
+
+        **Not filtered to requests still in the engine, and that is the
+        finding.** A page is only offered as an eviction candidate when
+        no request holds it -- vLLM's free queue *is* the unreferenced
+        set -- so intersecting an offered page's beneficiaries with the
+        live set is guaranteed to be empty, by construction. Measured:
+        every one of 24,472 offered pages reported exactly one live
+        beneficiary, which was the fallback firing, while the recorded
+        counts behind it ranged over 1..6.
+
+        So demand for a candidate is necessarily demand in the recent
+        past: who has been hitting this prefix. That is the quantity
+        `peek` ranks by -- a page many conversations keep returning to is
+        worth keeping -- and it is the only one an eviction candidate can
+        carry.
+        """
+        wanted = BENEFICIARIES_OF_PAGE.get(page_id)
+        if not wanted:
+            return []
+        return list(wanted)
 
     def _offered_pages(self) -> list[tuple[str, Any]]:
         """Cached blocks that are candidates for eviction, coldest first.
@@ -699,6 +769,16 @@ class PlexObserver:
         # four cache policies within 4% of LRU, none beating it, on two
         # different corpora including one built so that recency and
         # frequency disagree.
+        # Which requests are still in the engine. A page wanted only by
+        # requests that have already finished is wanted by nobody, and
+        # counting them would make demand climb monotonically over a run.
+        live_ids = {
+            request.request_id
+            for request in (
+                *self._scheduler.running,
+                *self._scheduler.waiting,
+            )
+        }
         for rank, (page_id, block) in enumerate(offered):
             page_tokens = int(getattr(block, "_block_hash_num_tokens", 0) or 0)
             beneficiary_steps = step_distance.get(page_id)
@@ -723,13 +803,18 @@ class PlexObserver:
                 # prefix kept can name this instead of the page, and the
                 # name survives the page.
                 "prefix": {"text": ROOT_OF_PAGE.get(page_id, page_id)},
-                # Who this page was computed for. One id: vLLM's pool is
-                # flat and a block belongs to the request that hashed it,
-                # whatever later requests hit it.
-                "beneficiaries": {
-                    "ids": [BENEFICIARY_OF_PAGE[page_id]]
-                    if page_id in BENEFICIARY_OF_PAGE
-                    else []
+                # Who would benefit if this page survived: the requests
+                # still in the engine whose chain includes it. Not "who
+                # computed it" -- that is authorship, it is 1 by
+                # construction, and `peek` ranks by demand.
+                "beneficiaries": {"ids": self._wanted_by(page_id, live_ids)},
+                # How many requests were ever recorded as wanting this
+                # page, live or not. Published next to `beneficiaries`
+                # because the two together say which of the two ways a
+                # demand count can be 1 actually happened: nothing was
+                # recorded, or everything recorded has finished.
+                "beneficiaries-recorded": {
+                    "num": len(BENEFICIARIES_OF_PAGE.get(page_id, ()))
                 },
                 "hit-count": {
                     "num": int(self._page_hits.get(page_id, 0))
@@ -762,13 +847,20 @@ class PlexObserver:
                 # The program this page serves, inherited from the
                 # request that computed it. This is what makes a page
                 # attributable to a session at all.
+                #
+                # Any one of the recorded beneficiaries answers this:
+                # they all reached the same prefix, so they are the same
+                # program. The demand *count* is the other fact and is
+                # published as `beneficiaries`.
                 **(
                     {
                         "program-id": {
-                            "text": _program_of(BENEFICIARY_OF_PAGE[page_id])
+                            "text": _program_of(
+                                next(iter(BENEFICIARIES_OF_PAGE[page_id]))
+                            )
                         }
                     }
-                    if page_id in BENEFICIARY_OF_PAGE
+                    if BENEFICIARIES_OF_PAGE.get(page_id)
                     else {}
                 ),
                 # When this page is next needed, as far as a queue can

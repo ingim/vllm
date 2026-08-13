@@ -12,6 +12,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.sched.plex_observer import note_demand as plex_note_demand
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -285,6 +286,16 @@ class KVCacheManager:
         )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
+        # Who wants these pages, recorded where the wanting happens.
+        #
+        # `note_chain` runs where blocks are newly *cached*, so it names
+        # the request that computed a page and never the ones that hit
+        # it -- the count is 1 by construction, which reduces a policy
+        # ranking by concurrent demand to ranking by a constant. This is
+        # the other half: a request reaching a cached prefix is demand
+        # for it, and this is the only place both are in hand.
+        if getattr(self.block_pool, "plex_eviction", None) is not None:
+            plex_note_demand(computed_blocks, request.request_id)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
     def allocate_slots(
