@@ -330,6 +330,15 @@ class PlexObserver:
         # is still holding.
         self._program_arrival: dict[str, int] = {}
         self._finished: list[list[str]] = []
+        # The pause edge. vLLM does not announce a preemption; it
+        # increments a counter on the request and puts it back on the
+        # waiting queue. So the edge is the *rise* in that counter, and
+        # holding the last seen value per request is the only way to see
+        # it. Without this the contract's `on-paused` hook can never
+        # fire against this engine, which is not the same as the engine
+        # never preempting.
+        self._paused: list[list[str]] = []
+        self._preemptions: dict[str, int] = {}
 
     # ── the hooks, and there are two ─────────────────────────────────────
 
@@ -413,6 +422,30 @@ class PlexObserver:
             return 0
         return self._verbs.drain()
 
+    def _note_preemptions(self) -> None:
+        """Raise the pause edge for any request preempted since last step.
+
+        `num_preemptions` only ever rises, so a difference against the
+        last seen value is exactly one edge per preemption, and a
+        request preempted twice raises it twice. The initiator is
+        `host`: vLLM decided this, not a policy -- and reporting it as
+        `policy` would credit the policy with an eviction it never
+        ordered.
+
+        Requests are forgotten when they leave, so the table cannot
+        outgrow the engine's own request set.
+        """
+        live = set()
+        for request in self._tracked():
+            request_id = request.request_id
+            live.add(request_id)
+            count = int(getattr(request, "num_preemptions", 0) or 0)
+            if count > self._preemptions.get(request_id, 0):
+                self._paused.append([request_id, "host"])
+            self._preemptions[request_id] = count
+        for gone in [key for key in self._preemptions if key not in live]:
+            self._preemptions.pop(gone, None)
+
     def on_step(self) -> str:
         """One scheduler step, as a document the port reads."""
         # A standing table lands here, between scheduling passes, because
@@ -433,6 +466,7 @@ class PlexObserver:
         self._step += 1
         global CURRENT_STEP
         CURRENT_STEP = self._step
+        self._note_preemptions()
         document_now_ms = int(time.time() * 1000)
         if self._last_step_ms is not None:
             self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
@@ -449,6 +483,7 @@ class PlexObserver:
         }
         self._admitted.clear()
         self._finished.clear()
+        self._paused.clear()
         return json.dumps(document)
 
     # ── scraping ─────────────────────────────────────────────────────────
@@ -1085,6 +1120,8 @@ class PlexObserver:
             events["admitted"] = list(self._admitted)
         if self._finished:
             events["finished"] = [list(entry) for entry in self._finished]
+        if self._paused:
+            events["paused"] = [list(entry) for entry in self._paused]
         return events
 
 
