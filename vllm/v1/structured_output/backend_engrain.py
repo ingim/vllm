@@ -702,18 +702,25 @@ class EngrainBackend(StructuredOutputBackend):
     def _batch_for(self, size: int):
         """A device batch big enough for `size` sequences, reused across steps.
 
-        Rebuilt when the pool has moved under it as well as when it is too
-        small: admitting a grammar can raise a ceiling, and buffers sized
-        against the old one are too small for the new.
+        Rebuilt when a grammar has raised a ceiling the buffers were sized
+        from, and when it is too small. **Not** when the pool has merely moved
+        its arrays, which is what admitting a grammar into a full array does.
+
+        Nothing a batch owns points into the arena. Its buffers - the mask, the
+        stacks, the lexer states, the memo - are sized from the pool's ceilings
+        and allocated for itself, and `outgrown` is exactly the question of
+        whether those ceilings have risen. What does point into the arena is a
+        recorded CUDA graph, and a batch refuses to replay one it did not
+        record against; this backend records none, because a mask that has to
+        be read back on the host cannot be in a graph anyway.
+
+        Rebuilding on a move was a whole batch of allocations and kernel
+        warmup, paid every time a request arrived with a schema large enough to
+        grow an array - which on a workload of hundreds of schemas is most of
+        them, and which lands on the arriving request's time to first token.
         """
         with self.lock:
-            stale = self.batch is not None and (
-                self.batch.pool_revision != self.pool.revision
-                # A grammar can raise a ceiling without moving an array, and
-                # buffers sized against the old one are too small for the new.
-                or self.batch.outgrown
-            )
-            if self.batch is None or self.batch.batch < size or stale:
+            if self.batch is None or self.batch.batch < size or self.batch.outgrown:
                 width = max(size, self.max_num_seqs)
                 # Said before it is spent. Everything a batch allocates is a
                 # function of what the pool already knows, so an operator can
