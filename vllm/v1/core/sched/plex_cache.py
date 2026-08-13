@@ -196,7 +196,11 @@ class PlexEviction:
         # difference between this and `calls` is how much work the
         # attachment avoided.
         self.settled = 0
-
+        # A run shorter than the report stride used to end having said
+        # nothing at all, and a missing line reads exactly like a
+        # splicer that never ran. Three cache arms were called flat on
+        # that silence. The counters are the only evidence the order
+        # reached the pool, so they are printed unconditionally at exit.
     @staticmethod
     def maybe() -> PlexEviction | None:
         """Attached only when asked for, like every other stage."""
@@ -247,6 +251,13 @@ class PlexEviction:
                 # only from the front.
                 self._rank = {page: i for i, page in enumerate(self._order)}
                 self.installs += 1
+                # Report on each new order rather than only on a call
+                # stride. A run shorter than the stride ended having
+                # said nothing, and a missing line reads exactly like a
+                # splicer that never ran -- three cache arms were called
+                # flat on that silence. `atexit` does not help: the
+                # harness stops the engine with SIGTERM.
+                self._report(force=True)
             return
 
     def _settled(self, queue: FreeKVCacheBlockQueue) -> bool:
@@ -471,7 +482,7 @@ class PlexEviction:
         queue.append_n(movers)
         self.pinned += len(movers)
 
-    def _report(self) -> None:
+    def _report(self, force: bool = False) -> None:
         """Say what the order actually reached, periodically.
 
         Not optional and not silent. A policy whose every named page is
@@ -482,7 +493,7 @@ class PlexEviction:
         in the engine's own log because that is where a reader goes when
         an arm comes out flat.
         """
-        if self.calls % 200:
+        if self.calls % 200 and not force:
             return
         print(
             f"[plex-cache] calls={self.calls} named={self.named} "
