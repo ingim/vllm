@@ -55,6 +55,24 @@ def _client_of(request_id: str) -> str:
     return head if sep else request_id
 
 
+def _program_of(request_id: str) -> str:
+    """The program a request belongs to, from the caller's own id.
+
+    Same `program::step` convention as `client_id`, with the engine's own
+    `cmpl-` prefix stripped so the name is the caller's. A session policy
+    ranks by which program a page serves, and vLLM has no session
+    concept, so this is the caller's label or nothing. Measured:
+    `continuum` read `program-id` 113,034 times without an answer, ranked
+    every page identically and sat on the baseline across three corpora,
+    which read as a policy that does not reproduce.
+    """
+    head = _client_of(request_id)
+    for prefix in ("cmpl-", "chatcmpl-"):
+        if head.startswith(prefix):
+            return head[len(prefix):]
+    return head
+
+
 def _max_tokens_of(request: Any) -> int:
     """The output ceiling the caller asked for, if the engine kept it."""
     params = getattr(request, "sampling_params", None)
@@ -225,6 +243,13 @@ class PlexObserver:
         self._last_step_ms: int | None = None
         self._offered_last: set[str] = set()
         self._bytes_per_token = int(os.environ.get("VLLM_PLEX_BYTES_PER_TOKEN", "0"))
+        if not self._bytes_per_token:
+            self._bytes_per_token = self._derive_bytes_per_token()
+        # First sighting of each program, so a session policy can price
+        # how long a program has been resident. Bounded with the page
+        # tables below: a program nobody has sent for is not one a policy
+        # is still holding.
+        self._program_arrival: dict[str, int] = {}
         self._finished: list[list[str]] = []
 
     # ── the hooks, and there are two ─────────────────────────────────────
@@ -439,10 +464,32 @@ class PlexObserver:
             walked += 1
         return offered
 
+    def _derive_bytes_per_token(self) -> int:
+        """How wide a token's KV is, from the engine's own cache spec.
+
+        The env var stays the override. Without a width, `size-bytes` is
+        unanswerable and a size-aware policy ranks nothing -- `marconi`
+        prices recency against size and read `size-bytes` 38,207 times
+        without an answer -- so it is worth deriving rather than
+        requiring every caller to know it. Returns 0 when the build does
+        not expose a spec, because a made-up width is worse than none.
+        """
+        try:
+            groups = self._scheduler.kv_cache_config.kv_cache_groups
+            block_size = self._scheduler.cache_config.block_size
+            page_bytes = groups[0].kv_cache_spec.page_size_bytes
+            return int(page_bytes) // max(int(block_size), 1)
+        except (AttributeError, IndexError, TypeError, ZeroDivisionError):
+            return 0
+
     def _facts(self, now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {request.request_id for request in self._scheduler.running}
         held_ids = self._held_ids()
         facts: dict[str, dict[str, Any]] = {}
+        for request in self._tracked():
+            self._program_arrival.setdefault(
+                _program_of(request.request_id), now_ms
+            )
         for request in self._tracked():
             running = request.request_id in running_ids
             prompt = request.num_prompt_tokens
@@ -476,6 +523,17 @@ class PlexObserver:
                 # 7.000, because the policy had nothing to be fair
                 # between.
                 "client_id": {"text": _client_of(request.request_id)},
+                # The program the request belongs to, and when that
+                # program first arrived. A session policy prices a
+                # program's whole residency, so it needs both the name
+                # and the age; neither exists in an engine that has no
+                # session concept, and both are in the caller's id.
+                "program-id": {"text": _program_of(request.request_id)},
+                "program-arrival": {
+                    "num": self._program_arrival.get(
+                        _program_of(request.request_id), now_ms
+                    )
+                },
                 # The group a request belongs to, from the caller's id.
                 #
                 # `justitia` prices memory-time "over the whole agent,
@@ -604,6 +662,7 @@ class PlexObserver:
         # different corpora including one built so that recency and
         # frequency disagree.
         for rank, (page_id, block) in enumerate(offered):
+            page_tokens = int(getattr(block, "_block_hash_num_tokens", 0) or 0)
             facts[page_id] = {
                 # Resident, because an eviction candidate is by
                 # definition still in the pool — it is on the free list,
@@ -612,12 +671,8 @@ class PlexObserver:
                 "targets": {"ids": [self._target]},
                 "tier": {"text": "gpu"},
                 "pinned": {"flag": getattr(block, "ref_cnt", 0) > 0},
-                "page-tokens": {
-                    "num": int(getattr(block, "_block_hash_num_tokens", 0) or 0)
-                },
-                "size-tokens": {
-                    "num": int(getattr(block, "_block_hash_num_tokens", 0) or 0)
-                },
+                "page-tokens": {"num": page_tokens},
+                "size-tokens": {"num": page_tokens},
                 # Older by rank, so the head of the queue is the oldest.
                 "last-access-ms": {"num": max(now_ms - rank, 0)},
                 # Every offered page is a leaf. vLLM's pool is flat --
@@ -640,6 +695,43 @@ class PlexObserver:
                 "hit-count": {
                     "num": int(self._page_hits.get(page_id, 0))
                 },
+                # Flat pool, stated rather than left unanswered. `leaf`
+                # already says the same thing; a policy that ranks by
+                # how many pages sit below this one is entitled to the
+                # answer zero instead of a fallback that ties every
+                # page with every other.
+                "child-count": {"num": 0},
+                "object-kind": {"text": "kv"},
+                # What it costs to get this page back: the tokens the
+                # engine would have to prefill again. A page is worth
+                # keeping in proportion to what losing it costs, and an
+                # eviction-cost policy that is told no cost ranks
+                # nothing. Measured: `infercept` read `reload-cost`
+                # 76,414 times without an answer.
+                "reload-cost": {"num": page_tokens},
+                "recompute-tokens": {"num": page_tokens},
+                # Free to take: an offered page with no reference on it
+                # is exactly what the engine is about to reclaim.
+                "reclaimable": {"flag": getattr(block, "ref_cnt", 0) == 0},
+                # Only when the engine was told the width of a token.
+                # A size in bytes computed from a zero is not a size.
+                **(
+                    {"size-bytes": {"num": page_tokens * self._bytes_per_token}}
+                    if self._bytes_per_token
+                    else {}
+                ),
+                # The program this page serves, inherited from the
+                # request that computed it. This is what makes a page
+                # attributable to a session at all.
+                **(
+                    {
+                        "program-id": {
+                            "text": _program_of(BENEFICIARY_OF_PAGE[page_id])
+                        }
+                    }
+                    if page_id in BENEFICIARY_OF_PAGE
+                    else {}
+                ),
             }
             # Counted here, once per step the page is offered. A page
             # that keeps reappearing in the offer is one the engine has
