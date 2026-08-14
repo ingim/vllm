@@ -211,6 +211,22 @@ BENEFICIARIES_OF_PAGE: dict[str, set[str]] = {}
 # far as any ranking is concerned.
 BENEFICIARY_LIMIT = 64
 
+# What a preempted token costs to recompute, and what it costs to swap.
+#
+# `_MS_PER_PREFILL_TOKEN` is deliberately coarse: the comparison policies
+# make with it is against a sentinel, so its precision cannot change any
+# decision, and a per-request measured rate would imply an accuracy this
+# does not have.
+#
+# `_NO_SWAP_MS` is not "very expensive". vLLM v1 has no CPU-offload path
+# a port may drive, so swap is unavailable, and a policy comparing
+# against it must reach the same verdict for every request regardless of
+# size. Stated as a number because the fact vocabulary carries numbers;
+# the capability declaration in `plex_verbs.py` is where it is stated as
+# a capability.
+_MS_PER_PREFILL_TOKEN = 0.05
+_NO_SWAP_MS = 1_000_000_000
+
 # The scheduling step most recently observed, and the step at which each
 # page was last actually demanded. Module-level because `note_demand` is
 # a hook on the cache manager and has no observer to ask.
@@ -995,6 +1011,32 @@ class PlexObserver:
                 # one, so this is not a partition of engine time and
                 # must not be summed to get utilisation.
                 "service_us": {"num": self._service_us.get(request.request_id, 0)},
+                # The two costs a policy compares when it decides how to
+                # evict, published because this engine is the only party
+                # that knows either.
+                #
+                # `qlm` stages `pause(preserve)` iff recompute costs more
+                # than swap. Both facts were unanswered -- 581 times in a
+                # single trace -- so it fell back to `computation-length`
+                # vs `cached-tokens`, two token counts standing in for two
+                # durations, and concluded `preserve` on every one. vLLM
+                # declines that disposition by design, so all 581 pauses
+                # were refused and its entire overload defence never ran.
+                #
+                # Recompute is honest arithmetic: the tokens preemption
+                # would discard, at this request's own observed prefill
+                # rate. Swap is `_NO_SWAP_MS`, a sentinel, and it is the
+                # true answer rather than a large guess -- v1 has no
+                # CPU-offload path a port may drive, so swapping is not
+                # expensive here, it is unavailable, and the comparison a
+                # policy makes against an unavailable option should come
+                # out the same way every time. `plex_verbs.py` already
+                # declares this in `capabilities()`; this states the same
+                # fact in the vocabulary policies actually read.
+                "recompute_cost_ms": {
+                    "num": int(computed * _MS_PER_PREFILL_TOKEN)
+                },
+                "swap_cost_ms": {"num": _NO_SWAP_MS},
                 # Published only when stated. A deadline of zero is not
                 # "no deadline" to a policy that subtracts from it, it
                 # is a deadline already missed, and the two must not
