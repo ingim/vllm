@@ -376,7 +376,62 @@ class PlexObserver:
         # A deadline is a property of the deployment and not something
         # vLLM has a concept of, so the operator states it, exactly as
         # the tenant label is stated in the request id.
-        self._slo_ms = int(os.environ.get("VLLM_PLEX_SLO_MS", "0") or 0)
+        # One deadline, or one per tenant.
+        #
+        # `VLLM_PLEX_SLO_MS=30000` states a deployment-wide deadline.
+        # `VLLM_PLEX_SLO_MS=c0=60000,c1=15000,default=30000` states one
+        # per tenant, and the second form is not a convenience.
+        #
+        # A deadline-ordering policy sorts by `slo-ms - waiting-ms`.
+        # Hold `slo-ms` constant across every request and that
+        # expression is a strictly decreasing function of waiting time,
+        # so **the earliest-deadline order is the arrival order** and
+        # EDF is FCFS with extra arithmetic. Measured: `slos-serve`
+        # ranked 98% of the queue and moved 6.1% of it, and its
+        # treatment arm matched its own control to four digits.
+        # Heterogeneous deadlines are what make a deadline schedulable.
+        self._slo_ms = 0
+        self._slo_by_client: dict[str, int] = {}
+        raw = (os.environ.get("VLLM_PLEX_SLO_MS", "") or "").strip()
+        if "=" in raw:
+            for item in raw.split(","):
+                name, _, value = item.partition("=")
+                try:
+                    number = int(float(value))
+                except ValueError:
+                    continue
+                if name.strip() == "default":
+                    self._slo_ms = number
+                else:
+                    self._slo_by_client[name.strip()] = number
+        elif raw:
+            try:
+                self._slo_ms = int(float(raw))
+            except ValueError:
+                self._slo_ms = 0
+        # The service classes a deployment sells, stated by the operator.
+        #
+        # `is-best-effort` and `tpot-ms` are the two facts SLOs-Serve is
+        # written about, and neither is something an engine can derive:
+        # whether a request is allowed to be deferred is a commercial
+        # fact about the tenant, and a per-token latency target is a
+        # promise someone made. vLLM has concepts for neither, so the
+        # operator states them exactly as the tenant label is stated in
+        # the request id and the deadline in `VLLM_PLEX_SLO_MS`.
+        #
+        # Absent, every request defaults to `is-best-effort: false` --
+        # so a policy whose mechanism is "defer the deferrable to
+        # protect the promised" has an empty set to defer and cannot act
+        # however hard it ranks. Measured: slos-serve read
+        # `is-best-effort` 4878 times in one trace, got nothing every
+        # time, and returned a treatment arm identical to its own
+        # control in every digit.
+        self._best_effort = {
+            name.strip()
+            for name in os.environ.get("VLLM_PLEX_BEST_EFFORT", "").split(",")
+            if name.strip()
+        }
+        self._tpot_ms = int(os.environ.get("VLLM_PLEX_TPOT_MS", "0") or 0)
         self._offered_last: set[str] = set()
         self._progress_last: dict[str, int] = {}
         self._bytes_per_token = int(os.environ.get("VLLM_PLEX_BYTES_PER_TOKEN", "0"))
@@ -482,6 +537,26 @@ class PlexObserver:
         from vllm.v1.request import RequestStatus
 
         self._scheduler.finish_requests(ids, RequestStatus.FINISHED_ABORTED)
+
+    @staticmethod
+    def _tenant_of(request_id: str) -> str:
+        """The tenant name an operator would write down.
+
+        `_client_of` returns the id's first field, which the API server
+        has already prefixed -- `cmpl-c0`, not `c0`. That prefix is the
+        engine's, not the caller's, and an operator declaring a service
+        class writes the tenant they sell to. Stripping it here rather
+        than asking every declaration to know about vLLM's id format.
+        """
+        head = _client_of(request_id)
+        for prefix in ("cmpl-", "chat-", "chatcmpl-", "embd-"):
+            if head.startswith(prefix):
+                return head[len(prefix):]
+        return head
+
+    def _slo_of(self, request_id: str) -> int:
+        """This request's deadline: its tenant's, or the deployment's."""
+        return self._slo_by_client.get(self._tenant_of(request_id), self._slo_ms)
 
     def drain_verbs(self) -> int:
         """Enact staged verbs and refusals. Called before a pass begins.
@@ -1042,10 +1117,30 @@ class PlexObserver:
                 # is a deadline already missed, and the two must not
                 # read the same.
                 **(
-                    {"slo_ms": {"num": self._slo_ms}}
-                    if self._slo_ms > 0
+                    {"slo_ms": {"num": self._slo_of(request.request_id)}}
+                    if self._slo_of(request.request_id) > 0
                     else {}
                 ),
+                # The service class, per request, from the tenant.
+                #
+                # Published unconditionally once any tenant is declared
+                # best-effort, because here `false` is a real answer --
+                # "this request is promised" -- and must not read the
+                # same as "nobody said". When no class is declared at
+                # all the fact is absent, which is the honest reading of
+                # a deployment that sells one tier.
+                **(
+                    {
+                        "is_best_effort": {
+                            "flag": self._tenant_of(request.request_id)
+                            in self._best_effort
+                        }
+                    }
+                    if self._best_effort
+                    else {}
+                ),
+                # The per-token latency target, when one was promised.
+                **({"tpot_ms": {"num": self._tpot_ms}} if self._tpot_ms > 0 else {}),
                 # The same quantity the corpus also reads under a
                 # second name. Published rather than left absent:
                 # a policy reading it gets `unknown-key` and
