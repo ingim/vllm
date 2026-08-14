@@ -1337,6 +1337,24 @@ class PlexObserver:
         median = window[len(window) // 2]
         return (median, median * 1000)
 
+    def _table_staleness(self) -> dict[str, Any]:
+        """How old the installed order is, when there is one.
+
+        Absent when no table is installed, because zero would read as
+        "perfectly fresh" to anything that reports a mean, and the
+        FCFS arms have no table at all rather than a maximally fresh
+        one.
+        """
+        queue = getattr(self._scheduler, "waiting", None)
+        age = getattr(queue, "table_age", None)
+        installs = getattr(queue, "installs", None)
+        if age is None or installs is None or installs == 0:
+            return {}
+        return {
+            "table_age_arrivals": {"num": int(age)},
+            "table_installs": {"num": int(installs)},
+        }
+
     def _target_facts(self) -> dict[str, Any]:
         scheduler = self._scheduler
         pool = scheduler.kv_cache_manager.block_pool
@@ -1386,6 +1404,23 @@ class PlexObserver:
                 else 0
             },
             "kv_overloaded": {"flag": self._kv_overloaded()},
+            # How stale the standing order is, measured in the only unit
+            # that matters to it: arrivals since it was installed.
+            #
+            # An ordering channel has a latency. The policy computes an
+            # order over the queue it was shown, and by the time the
+            # scheduler reads it the queue has moved on -- so a table is
+            # only as good as the fraction of the queue it still names.
+            # `PlexRequestQueue` has counted this since it was written
+            # and nothing ever read the counter, which is the same shape
+            # of defect as the verbs nobody carried.
+            #
+            # It became worth publishing when `vtc` -- reproducing at
+            # 5.790x on SGLang -- fell to 1.007x under a four-token
+            # output cap, where the queue turns over roughly three times
+            # faster. Two explanations fit and no counter separated
+            # them. This is that counter.
+            **self._table_staleness(),
             "step_ms": {"num": step_ms},
             # Time per output token, from the observer's own timing. The
             # engine keeps no such number, so this is measured rather
