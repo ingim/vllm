@@ -49,10 +49,46 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+_LEGACY_LASTACCESS = os.environ.get("PLEX_LEGACY_LASTACCESS") == "1"
+
+
+def _strip_engine_prefix(head: str) -> str:
+    """The caller's own name, without vLLM's `cmpl-`/`chatcmpl-`."""
+    for prefix in ("cmpl-", "chatcmpl-"):
+        if head.startswith(prefix):
+            return head[len(prefix):]
+    return head
+
+
+def _tenant_and_program(request_id: str) -> tuple[str, str]:
+    """Split the id's first field into a tenant and a program.
+
+    The convention is `[<tenant>@]<program>::<step>::...`. Without the
+    `@` the tenant *is* the program, which is what every id written
+    before this existed means and what a single-tenant workload means.
+
+    Measured, and the reason the `@` exists: `client-id`, `user-id`,
+    `program-id` and `group` were the identical set partition over all
+    248 requests of a capture, because three of the four read field 0 of
+    one string and the fourth read field 1 of it. Per-tenant fairness
+    (`vtc`, `justitia`) and per-program affinity (`parrot`, `saga`) were
+    therefore not policies that happened to tie -- they were the same
+    policy, drawing a distinction the port could not express. No
+    workload could separate them, so the wire format had to.
+    """
+    head, sep, _ = request_id.partition("::")
+    if not sep:
+        head = request_id
+    head = _strip_engine_prefix(head)
+    tenant, at, program = head.partition("@")
+    if not at:
+        return head, head
+    return tenant, program
+
+
 def _client_of(request_id: str) -> str:
     """The tenant a request belongs to, from the caller's own id."""
-    head, sep, _ = request_id.partition("::")
-    return head if sep else request_id
+    return _tenant_and_program(request_id)[0]
 
 
 def _program_of(request_id: str) -> str:
@@ -66,11 +102,7 @@ def _program_of(request_id: str) -> str:
     every page identically and sat on the baseline across three corpora,
     which read as a policy that does not reproduce.
     """
-    head = _client_of(request_id)
-    for prefix in ("cmpl-", "chatcmpl-"):
-        if head.startswith(prefix):
-            return head[len(prefix):]
-    return head
+    return _tenant_and_program(request_id)[1]
 
 
 def _program_plan(request_id: str) -> dict[str, Any]:
@@ -125,16 +157,18 @@ def _field_of(request_id: str, index: int) -> str:
 def _group_of(request_id: str) -> str:
     """The group a request belongs to, from the caller's own id.
 
-    `<client>::<group>::<rest>`. Falls back to the client when there is
-    no second separator, so a workload that names no groups puts each
-    tenant in one group rather than each request in its own -- the
-    latter is what "no groups" used to mean and it is the degenerate
-    case both group-aware policies are written against.
+    A group is a *session*: the run of requests a caller issues against
+    one shared context. That is exactly what the program field names, so
+    the group is the program.
+
+    It used to be `<field0>::<field1>`, which read the id's second field
+    as the group when the convention puts the caller's per-request step
+    counter there. Measured on a 248-request capture: that spelling gave
+    219 groups, 202 of them singletons, and the corpus's group-aware
+    policies were being handed a workload with no sessions in it. The
+    program field gives the 30 sessions of eight that were actually run.
     """
-    parts = request_id.split("::")
-    if len(parts) >= 3:
-        return f"{parts[0]}::{parts[1]}"
-    return parts[0]
+    return _tenant_and_program(request_id)[1]
 
 
 def _page_id(block_hash: Any) -> str:
@@ -968,7 +1002,7 @@ class PlexObserver:
                 # falling back to what precedes it so a workload that
                 # names fewer levels degrades to coarser accounting
                 # rather than to none.
-                "user_id": {"text": _field_of(request.request_id, 0)},
+                "user_id": {"text": _client_of(request.request_id)},
                 "application_id": {"text": _field_of(request.request_id, 1)},
                 "stage_id": {"text": _field_of(request.request_id, 2)},
                 # The deployment's own rate limits, from the environment.
@@ -1199,7 +1233,31 @@ class PlexObserver:
                 "page-tokens": {"num": page_tokens},
                 "size-tokens": {"num": page_tokens},
                 # Older by rank, so the head of the queue is the oldest.
-                "last-access-ms": {"num": max(now_ms - rank, 0)},
+                #
+                # The head of `free_block_queue` is what vLLM would
+                # evict next, i.e. the *coldest* page, so it must carry
+                # the *smallest* timestamp. Writing `now_ms - rank` gave
+                # it the largest and inverted every recency policy in
+                # the corpus: `probe-truelru`, `marconi`, `helium` and
+                # `preble` each installed the exact reverse of this
+                # queue at 92 of 92 plans, evicting the hottest resident
+                # page first. Counting down from the tail fixes the sign
+                # without inventing a clock the pool does not keep.
+                # `PLEX_LEGACY_LASTACCESS=1` restores the inverted
+                # spelling so the two can be captured as a paired arm on
+                # one workload. Simulating the repair by rewriting a
+                # trace is not the same experiment: the capture that
+                # first showed the inversion had 148 steps and ~100
+                # offered pages, a later one had 793 and ~511, and the
+                # class tables differ for both reasons at once.
+                "last-access-ms": {
+                    "num": max(
+                        now_ms - rank
+                        if _LEGACY_LASTACCESS
+                        else now_ms - (len(offered) - 1 - rank),
+                        0,
+                    )
+                },
                 # Every offered page is a leaf. vLLM's pool is flat --
                 # there is no tree, so no page has a page below it --
                 # and a cache port that filters on `leaf` should see all
