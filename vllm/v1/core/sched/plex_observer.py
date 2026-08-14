@@ -930,6 +930,31 @@ class PlexObserver:
                 "predicted_output_tokens": {
                     "num": int(_max_tokens_of(request) or 0)
                 },
+                # What this request was *expected* to cost, against which
+                # `output_tokens` is the actual.
+                #
+                # `fairserve` is the only reader and no engine published
+                # them, which does not make them optional: its weighted
+                # service counter is `actual / expected`, and a missing
+                # `expected` falls back to `actual`, so the ratio is
+                # identically 1 and every completed request charges the
+                # same 1000000 whatever its size. A counter meant to
+                # measure work degenerates into a count of completions,
+                # and the policy ranks lowest-completion-count-first
+                # while believing it ranks least-served-first. Silent,
+                # and it still produces a plausible fairness ordering --
+                # just not the paper's.
+                #
+                # The expectation for input is exact: the prompt is
+                # already here and its length is not a guess. For output
+                # it is the caller's `max_tokens`, the only statement of
+                # intended size anyone made. A request that stops early
+                # then charges less than one that runs to its cap, which
+                # is what `actual / expected` is for.
+                "expected_input_tokens": {"num": prompt},
+                "expected_output_tokens": {
+                    "num": int(_max_tokens_of(request) or 0)
+                },
                 "arrival_ms": {"num": int(request.arrival_time * 1000)},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
