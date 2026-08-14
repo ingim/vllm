@@ -362,6 +362,7 @@ class PlexObserver:
         # the tenant label is stated in the request id.
         self._slo_ms = int(os.environ.get("VLLM_PLEX_SLO_MS", "0") or 0)
         self._offered_last: set[str] = set()
+        self._progress_last: dict[str, int] = {}
         self._bytes_per_token = int(os.environ.get("VLLM_PLEX_BYTES_PER_TOKEN", "0"))
         if not self._bytes_per_token:
             self._bytes_per_token = self._derive_bytes_per_token()
@@ -1279,6 +1280,48 @@ class PlexObserver:
             "max_total_tokens": {"num": total_blocks * block_size},
         }
 
+    def _progress(self) -> list[list[Any]]:
+        """Tokens produced since the last step, per request.
+
+        `on-progress` was the one hook no engine raised. Nine policies
+        subscribe to it -- agentix, branch-regulation, dlpm, dynasor,
+        justitia, llumnix, pard, slos-serve, vtc -- and several learn
+        their service rate from it and can do nothing until it arrives.
+        branch-regulation is the clearest case: its price per token is
+        `service-us` differenced against these deltas, its auction is
+        shut while that price is zero, and a shut auction ranks every
+        branch at a cost of zero, which sorts back to arrival order. The
+        policy was not disagreeing with FCFS, it was never given the one
+        number it prices with.
+
+        A delta, not a total. `host/src/events.rs` has a test named
+        `progress_is_a_delta_not_a_total`, and a policy that accumulates
+        deltas would integrate the whole history at every step if handed
+        a cumulative count.
+
+        Deltas are dropped for requests seen for the first time. The
+        first sighting's tokens were produced before anyone was
+        watching, and charging them to one step would price that step at
+        a rate no step ever ran at.
+        """
+        deltas: list[list[Any]] = []
+        live: set[str] = set()
+        for request in self._tracked():
+            request_id = request.request_id
+            live.add(request_id)
+            produced = len(request.output_token_ids)
+            previous = self._progress_last.get(request_id)
+            self._progress_last[request_id] = produced
+            if previous is None:
+                continue
+            grew = produced - previous
+            if grew > 0:
+                deltas.append([request_id, grew])
+        for request_id in list(self._progress_last):
+            if request_id not in live:
+                del self._progress_last[request_id]
+        return deltas
+
     def _events(self) -> dict[str, Any]:
         events: dict[str, Any] = {}
         offered = [page_id for page_id, _ in self._offered_pages()]
@@ -1290,6 +1333,9 @@ class PlexObserver:
         if fresh:
             events["offered"] = fresh
         self._offered_last = set(offered)
+        progress = self._progress()
+        if progress:
+            events["progress"] = progress
         if self._admitted:
             events["admitted"] = list(self._admitted)
         if self._finished:
