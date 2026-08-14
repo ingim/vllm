@@ -320,6 +320,22 @@ class PlexObserver:
         # rather than averaging over a run whose shape has changed.
         self._step_ms_window: list[int] = []
         self._last_step_ms: int | None = None
+        # Cumulative microseconds of engine time per request; see the
+        # `service_us` fact.
+        self._service_us: dict[str, int] = {}
+        # The deployment's deadline, in milliseconds, or 0 for none.
+        #
+        # Read by chameleon, dualmap, goodserve, pard, qlm, slos-serve
+        # and branch-regulation, and published by neither engine until
+        # now. `branch-regulation` sizes its whole slack auction from
+        # `slo-ms` minus `waiting-ms`, so without it the budget is zero,
+        # the auction never opens and only trunks are ever funded --
+        # the policy runs, decides, and expresses a fraction of itself.
+        #
+        # A deadline is a property of the deployment and not something
+        # vLLM has a concept of, so the operator states it, exactly as
+        # the tenant label is stated in the request id.
+        self._slo_ms = int(os.environ.get("VLLM_PLEX_SLO_MS", "0") or 0)
         self._offered_last: set[str] = set()
         self._bytes_per_token = int(os.environ.get("VLLM_PLEX_BYTES_PER_TOKEN", "0"))
         if not self._bytes_per_token:
@@ -446,6 +462,37 @@ class PlexObserver:
         for gone in [key for key in self._preemptions if key not in live]:
             self._preemptions.pop(gone, None)
 
+    def _charge_service(self, elapsed_ms: int) -> None:
+        """Charge the step that just ended to whoever was running in it.
+
+        The interval is measured between step documents, so it is the
+        time the engine spent, not the time the port spent looking. It
+        is charged to `scheduler.running` because that is the set the
+        engine actually computed over.
+
+        Requests that have left are dropped rather than kept: the fact
+        is only ever read for a request that is present, and a ledger
+        that outlives its subjects is a leak on a long run.
+        """
+        if elapsed_ms <= 0:
+            return
+        charge = elapsed_ms * 1000
+        live = set()
+        for request in getattr(self._scheduler, "running", ()) or ():
+            request_id = getattr(request, "request_id", None)
+            if request_id is None:
+                continue
+            live.add(request_id)
+            self._service_us[request_id] = (
+                self._service_us.get(request_id, 0) + charge
+            )
+        if len(self._service_us) > len(live) + 4096:
+            self._service_us = {
+                key: value
+                for key, value in self._service_us.items()
+                if key in live
+            }
+
     def on_step(self) -> str:
         """One scheduler step, as a document the port reads."""
         # A standing table lands here, between scheduling passes, because
@@ -468,11 +515,17 @@ class PlexObserver:
         CURRENT_STEP = self._step
         self._note_preemptions()
         document_now_ms = int(time.time() * 1000)
+        elapsed_ms = (
+            max(document_now_ms - self._last_step_ms, 0)
+            if self._last_step_ms is not None
+            else 0
+        )
         if self._last_step_ms is not None:
-            self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
+            self._step_ms_window.append(elapsed_ms)
             if len(self._step_ms_window) > 32:
                 self._step_ms_window.pop(0)
         self._last_step_ms = document_now_ms
+        self._charge_service(elapsed_ms)
         document = {
             "step": self._step,
             "now-ms": document_now_ms,
@@ -804,6 +857,42 @@ class PlexObserver:
                 # standing test for whether a derivation belongs on this
                 # side.
                 "waiting_ms": {"num": max(now_ms - int(request.arrival_time * 1000), 0)},
+                # Engine time this request has accrued, cumulative.
+                #
+                # Read by nine policies -- agentix, branch-regulation,
+                # chameleon, dynasor, goodserve, infercept, pythia, qlm
+                # and saga -- and published by neither engine until now,
+                # so every one of them differenced a constant zero and
+                # took its default. `branch-regulation` derives its
+                # microseconds-per-token from exactly this difference,
+                # which is why it read `not reproduced` with a service
+                # vector that had barely moved.
+                #
+                # **A running request is charged the whole step**, not a
+                # share of it. The alternative -- dividing the step by
+                # the batch size -- would make a request's own service
+                # depend on who else happened to be batched with it,
+                # so the same request in a quiet batch and a busy one
+                # would report different service for identical work.
+                # The papers that read this treat it as "how long has
+                # the engine been working on you", and in a batched
+                # engine every member of the batch is being worked on
+                # for the whole step.
+                #
+                # Consequence worth stating: the sum over requests
+                # exceeds wall clock whenever the batch holds more than
+                # one, so this is not a partition of engine time and
+                # must not be summed to get utilisation.
+                "service_us": {"num": self._service_us.get(request.request_id, 0)},
+                # Published only when stated. A deadline of zero is not
+                # "no deadline" to a policy that subtracts from it, it
+                # is a deadline already missed, and the two must not
+                # read the same.
+                **(
+                    {"slo_ms": {"num": self._slo_ms}}
+                    if self._slo_ms > 0
+                    else {}
+                ),
                 # The same quantity the corpus also reads under a
                 # second name. Published rather than left absent:
                 # a policy reading it gets `unknown-key` and
