@@ -220,6 +220,10 @@ class EngrainBackend(StructuredOutputBackend):
         self._warned_about_narrowing = False
         self._warned_about_bounds = False
         self._warned_about_window = False
+        # What `prepare` made of each compiled grammar, so a schema evicted
+        # under the budget comes back as a device copy rather than as the
+        # host work of building its arrays again.
+        self.prepared: dict = {}
         self._narrowed_rows = 0
         self._narrowed_steps = 0
         self._narrow_report = 1
@@ -284,7 +288,19 @@ class EngrainBackend(StructuredOutputBackend):
                 # even when the tables are not.
                 if held is None or not self.pool.holds(*held):
                     try:
-                        identifier = self.pool.admit(compiled)
+                        # From the tables prepared last time, when there are
+                        # any. Under a budget an evicted schema comes back as
+                        # soon as a request wants it again, and `prepare` is
+                        # what an admission mostly is: 26 ms of a 26 ms
+                        # re-admission, against 8 when it is kept. The pool
+                        # separates the two for exactly this, and the cost is
+                        # host memory for a schema this process has already
+                        # decided to serve.
+                        tables = self.prepared.get(key)
+                        if tables is None:
+                            tables = self.pool.prepare(compiled)
+                            self.prepared[key] = tables
+                        identifier = self.pool.admit(tables)
                     except WindowTooWide as refusal:
                         # This grammar would size every row of every batch for
                         # itself - the replay window is 95% of a batch's memory
@@ -799,3 +815,4 @@ class EngrainBackend(StructuredOutputBackend):
 
     def destroy(self) -> None:
         self.compiled.clear()
+        self.prepared.clear()
